@@ -123,6 +123,51 @@ def post_briefing_to_slack() -> dict:
     return {"posted": ok, "channel": slack_connector._channel()}
 
 
+@router.get("/reconstruct/{scope}", summary="Reconstruct outage history for a scope")
+def reconstruct(scope: str, limit: int = 100) -> dict:
+    items = incident_store.incident_timeline(scope, limit=limit)
+
+    if not items:
+        return {"scope": scope, "events": [], "summary": "No incident history found for this scope."}
+
+    events = []
+    for incident in items:
+        events.append(
+            {
+                "timestamp": incident.get("started_at", ""),
+                "resolved_at": incident.get("resolved_at"),
+                "severity": incident.get("severity"),
+                "status": incident.get("status"),
+                "signals": incident.get("signal_types", []),
+                "causes": [cause["type"] for cause in incident.get("probable_causes", [])],
+                "blast_buildings": incident.get("blast_radius", {}).get("affected_buildings", []),
+                "notes": [note["text"] for note in incident.get("notes", [])],
+                "incident_id": incident.get("incident_id"),
+            }
+        )
+
+    open_count = sum(1 for event in events if event["status"] != "resolved")
+    resolved_count = sum(1 for event in events if event["status"] == "resolved")
+    all_signals = list({signal for event in events for signal in event["signals"]})
+    all_causes = list({cause for event in events for cause in event["causes"]})
+
+    summary = (
+        f"{len(events)} incident(s) recorded for {scope}. "
+        f"{open_count} open, {resolved_count} resolved. "
+        f"Signal types seen: {', '.join(all_signals) or 'none'}. "
+        f"Probable causes: {', '.join(all_causes) or 'none'}."
+    )
+
+    return {
+        "scope": scope,
+        "total_incidents": len(events),
+        "open": open_count,
+        "resolved": resolved_count,
+        "events": events,
+        "summary": summary,
+    }
+
+
 @router.get("/health-scores/{site_id}", summary="Risk scores for all buildings at a site")
 def site_health_scores(site_id: str) -> dict:
     return score_site(site_id, _ops())

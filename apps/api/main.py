@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from fastapi import FastAPI
 
+from apps.api.jake_router import router as jake_router
 from packages.pypr.config import load_policy
 from packages.pypr.intervention import decide_intervention
 from packages.pypr.memory import (
@@ -17,8 +18,14 @@ from packages.pypr.observation import infer_state
 from packages.pypr.reasoning import explain_assessment
 from packages.pypr.slack_adapter import router as slack_router
 
-app = FastAPI(title="pypr-core API", version="0.1.0")
+app = FastAPI(
+    title="pypr-core",
+    version="0.1.0",
+    description="Jake network operations + PYPR behavioral layer",
+)
+
 app.include_router(slack_router)
+app.include_router(jake_router)
 
 
 @app.on_event("startup")
@@ -26,17 +33,21 @@ def startup() -> None:
     init_db()
 
 
-@app.get("/health")
+# ── platform health ────────────────────────────────────────────────────────────
+
+@app.get("/health", tags=["platform"])
 def health() -> dict[str, str]:
-    return {"status": "ok", "identity": "PYPR"}
+    return {"status": "ok", "identity": "pypr-core"}
 
 
-@app.get("/v1/policy")
+@app.get("/v1/policy", tags=["platform"])
 def policy() -> dict:
     return load_policy()
 
 
-@app.post("/v1/signals/ingest", response_model=IngestResponse)
+# ── PYPR signal ingestion ──────────────────────────────────────────────────────
+
+@app.post("/v1/signals/ingest", response_model=IngestResponse, tags=["pypr"])
 def ingest_signal(signal: Signal) -> IngestResponse:
     persist_signal(signal)
 
@@ -82,19 +93,19 @@ def ingest_signal(signal: Signal) -> IngestResponse:
     return IngestResponse(assessment=assessment, intervention=intervention)
 
 
-@app.get("/v1/customers/{customer_id}/state", response_model=StateAssessment)
+@app.get("/v1/customers/{customer_id}/state", response_model=StateAssessment, tags=["pypr"])
 def customer_state(customer_id: str) -> StateAssessment:
     signals = recent_signals(customer_id)
     return infer_state(customer_id, signals)
 
 
-@app.post("/v1/memory")
+@app.post("/v1/memory", tags=["pypr"])
 def write_memory(record: MemoryRecord) -> dict[str, str]:
     persist_memory(record)
     return {"status": "stored"}
 
 
-@app.post("/v1/memory/search")
+@app.post("/v1/memory/search", tags=["pypr"])
 def search_memory(query: MemorySearchQuery) -> dict:
     items = query_memory(
         kind=query.kind,
@@ -106,7 +117,11 @@ def search_memory(query: MemorySearchQuery) -> dict:
     return {"count": len(items), "items": [item.model_dump(mode="json") for item in items]}
 
 
-@app.get("/v1/customers/{customer_id}/timeline")
+@app.get("/v1/customers/{customer_id}/timeline", tags=["pypr"])
 def customer_timeline(customer_id: str, limit: int = 50) -> dict:
     items = query_memory(key_prefix=f"customer:{customer_id}:", limit=limit)
-    return {"customer_id": customer_id, "count": len(items), "items": [item.model_dump(mode="json") for item in items]}
+    return {
+        "customer_id": customer_id,
+        "count": len(items),
+        "items": [item.model_dump(mode="json") for item in items],
+    }

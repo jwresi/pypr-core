@@ -1,0 +1,75 @@
+PYTHON := .venv/bin/python
+PIP    := .venv/bin/pip
+UVICORN := .venv/bin/uvicorn
+API_HOST ?= 127.0.0.1
+API_PORT ?= 8787
+
+.PHONY: help venv install dev-api dev-ui test-jake test-rename test-all \
+        lint fmt check clean
+
+# ── help ──────────────────────────────────────────────────────────────────────
+
+help:
+	@echo ""
+	@echo "  pypr-core"
+	@echo ""
+	@echo "  venv          create .venv with Python 3.12"
+	@echo "  install       pip install -r requirements.txt into .venv"
+	@echo "  dev-api       run FastAPI dev server  (http://$(API_HOST):$(API_PORT))"
+	@echo "  dev-ui        run Vite dev server      (http://127.0.0.1:4174)"
+	@echo "  test-jake     run Jake ops regression  (needs network_map.db)"
+	@echo "  test-rename   run rename-sheet regression"
+	@echo "  test-all      test-rename + test-jake"
+	@echo "  lint          ruff check packages/ apps/ tests/"
+	@echo "  fmt           ruff format packages/ apps/ tests/"
+	@echo "  check         lint + fmt --check"
+	@echo "  clean         remove .venv, __pycache__, output/, data/*.db"
+	@echo ""
+
+# ── environment ───────────────────────────────────────────────────────────────
+
+venv:
+	python3.12 -m venv .venv
+	@echo "venv ready — run: . .venv/bin/activate"
+
+install: venv
+	$(PIP) install --upgrade pip
+	$(PIP) install -r requirements.txt
+
+# ── dev servers ───────────────────────────────────────────────────────────────
+
+dev-api:
+	PYTHONPATH=$(CURDIR) $(UVICORN) apps.api.main:app \
+		--host $(API_HOST) --port $(API_PORT) --reload
+
+dev-ui:
+	cd apps/ui && npm run dev
+
+# ── tests ─────────────────────────────────────────────────────────────────────
+
+test-jake:
+	PYTHONPATH=$(CURDIR) $(PYTHON) tests/jake/run_jake_regression_suite.py
+
+test-rename:
+	PYTHONPATH=$(CURDIR) $(PYTHON) tests/jake/run_rename_sheet_regression.py
+
+test-all: test-rename test-jake
+
+# ── code quality ──────────────────────────────────────────────────────────────
+
+lint:
+	$(PYTHON) -m ruff check packages/ apps/ tests/ scripts/
+
+fmt:
+	$(PYTHON) -m ruff format packages/ apps/ tests/ scripts/
+
+check:
+	$(PYTHON) -m ruff check packages/ apps/ tests/ scripts/
+	$(PYTHON) -m ruff format --check packages/ apps/ tests/ scripts/
+
+# ── housekeeping ──────────────────────────────────────────────────────────────
+
+clean:
+	rm -rf .venv
+	find . -type d -name __pycache__ -exec rm -rf {} +
+	rm -rf output/ data/*.db

@@ -5,6 +5,7 @@ from enum import Enum
 from typing import Any
 
 from packages.jake.graph.topology import get_graph
+from packages.jake.incidents import store as incident_store
 
 
 class Severity(str, Enum):
@@ -69,7 +70,7 @@ def create_incident(scope: str, signals: list[dict], ops: Any) -> dict:
     if has_alert:
         actions.append({"action": "acknowledge_alertmanager_alert", "priority": 3})
 
-    return {
+    incident = {
         "incident_id": incident_id,
         "scope": scope,
         "severity": severity.value,
@@ -86,6 +87,8 @@ def create_incident(scope: str, signals: list[dict], ops: Any) -> dict:
         "recommended_actions": actions,
         "notes": [],
     }
+    incident_store.save_incident(incident)
+    return incident
 
 
 def correlate_from_jake(scope: str, ops: Any) -> dict:

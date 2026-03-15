@@ -3,6 +3,7 @@ from __future__ import annotations
 from fastapi import FastAPI
 
 from apps.api.jake_router import router as jake_router
+from apps.api.graph_router import router as graph_router
 from packages.pypr.config import load_policy
 from packages.pypr.intervention import decide_intervention
 from packages.pypr.memory import (
@@ -26,6 +27,7 @@ app = FastAPI(
 
 app.include_router(slack_router)
 app.include_router(jake_router)
+app.include_router(graph_router)
 
 
 @app.on_event("startup")

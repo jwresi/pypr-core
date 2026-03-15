@@ -161,8 +161,8 @@ def switch_summary(switch_id: str) -> dict:
 
 # ── MAC / device ───────────────────────────────────────────────────────────────
 
-@router.get("/mac/{mac}")
-def trace_mac(mac: str, include_bigmac: bool = True) -> dict:
+@router.get("/mac")
+def trace_mac(mac: str = Query(..., description="MAC address to trace"), include_bigmac: bool = True) -> dict:
     try:
         return _ops().trace_mac(mac, include_bigmac)
     except Exception as exc:

@@ -3,12 +3,13 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import subprocess
 import sys
 from collections import Counter
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parents[2]
 CSV_PATH = ROOT / 'output' / 'spreadsheet' / 'netbox_targeted_rename_proposals.csv'
 GENERATOR = ROOT / 'scripts' / 'generate_targeted_rename_sheet.py'
 
@@ -19,7 +20,8 @@ def assert_true(condition: bool, message: str) -> None:
 
 
 def main() -> None:
-    subprocess.run([str(ROOT / '.venv' / 'bin' / 'python'), str(GENERATOR)], check=True, cwd=ROOT, env={**dict(**__import__('os').environ), 'PYTHONPATH': str(ROOT)})
+    env = {**os.environ, 'PYTHONPATH': str(ROOT)}
+    subprocess.run([sys.executable, str(GENERATOR)], check=True, cwd=ROOT, env=env)
     rows = list(csv.DictReader(CSV_PATH.open()))
     by_name = {r['current_name']: r for r in rows}
     counts = Counter(r['confidence'] for r in rows)

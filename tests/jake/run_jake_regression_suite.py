@@ -3,10 +3,11 @@ from __future__ import annotations
 
 import json
 import re
+import sqlite3
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
@@ -44,7 +45,23 @@ def assert_true(condition: bool, message: str) -> None:
         raise AssertionError(message)
 
 
+def ensure_jake_db_ready() -> None:
+    db_path = ROOT / "network_map.db"
+    if not db_path.exists():
+        raise RuntimeError(f"missing Jake operational DB: {db_path}")
+
+    with sqlite3.connect(db_path) as conn:
+        row = conn.execute(
+            "select name from sqlite_master where type='table' and name='scans'"
+        ).fetchone()
+    if not row:
+        raise RuntimeError(
+            f"Jake regression requires a populated network_map.db with a scans table: {db_path}"
+        )
+
+
 def main() -> None:
+    ensure_jake_db_ready()
     ops = JakeOps()
     checks: list[dict] = []
 

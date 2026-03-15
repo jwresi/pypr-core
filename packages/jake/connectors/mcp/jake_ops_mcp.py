@@ -586,7 +586,7 @@ def infer_unit_port_candidates(
     return candidates
 
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+REPO_ROOT = Path(__file__).resolve().parents[4]
 ARTIFACT_PORT_MAP = Path(os.environ.get("JAKE_PORT_MAP") or os.environ.get("JAKE_ARTIFACT_PORT_MAP") or str(REPO_ROOT / "artifacts" / "customer_port_map" / "customer_port_map.json"))
 ARTIFACT_TRANSPORT_RADIO_SCAN = Path(os.environ.get("JAKE_TRANSPORT_RADIO_SCAN") or os.environ.get("JAKE_ARTIFACT_TRANSPORT_RADIO_SCAN") or str(REPO_ROOT / "artifacts" / "transport_radio_scan" / "transport_radio_scan.json"))
 VILO_AUDIT_OUT_DIR = Path(os.environ.get("JAKE_VILO_AUDIT_DIR") or os.environ.get("JAKE_VILO_AUDIT_OUT_DIR") or str(REPO_ROOT / "output" / "vilo_audit"))

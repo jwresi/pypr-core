@@ -27,6 +27,21 @@ Run the API:
 uvicorn apps.api.main:app --reload
 ```
 
+## Jake Prerequisites
+
+The imported Jake regression scripts and MCP logic expect local operational data and, for some workflows, external service credentials.
+
+- `network_map.db` at the repo root, or `JAKE_OPS_DB` pointing to it
+- optional `.env` at the repo root, or `JAKE_ENV_FILE` pointing to it
+- NetBox and other service credentials if you want the full Jake workflows instead of offline-only behavior
+
+Run the imported Jake scripts from the repo root:
+
+```bash
+.venv/bin/python tests/jake/run_jake_regression_suite.py
+.venv/bin/python tests/jake/run_rename_sheet_regression.py
+```
+
 ## UI Setup
 
 ```bash

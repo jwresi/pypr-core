@@ -171,7 +171,7 @@ TOOLS = [
 
 
 def load_local_env_file() -> None:
-    env_path = Path(os.environ.get("JAKE_ENV_FILE", str(Path(__file__).resolve().parent.parent / ".env")))
+    env_path = Path(os.environ.get("JAKE_ENV_FILE", str(Path(__file__).resolve().parents[4] / ".env")))
     if not env_path.exists():
         return
     for raw in env_path.read_text(encoding="utf-8").splitlines():

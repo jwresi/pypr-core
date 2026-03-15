@@ -178,9 +178,12 @@ def netbox_device(name: str) -> dict:
 
 
 @router.get("/recovery-ready-cpes")
-def recovery_ready_cpes() -> dict:
+def recovery_ready_cpes(
+    building_id: str | None = None,
+    site_id: str | None = None,
+) -> dict:
     try:
-        return _ops().get_recovery_ready_cpes()
+        return _ops().get_recovery_ready_cpes(building_id=building_id, site_id=site_id)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
@@ -201,9 +204,12 @@ def outage_context(
 # ── rogue DHCP ─────────────────────────────────────────────────────────────────
 
 @router.get("/rogue-dhcp-suspects")
-def rogue_dhcp_suspects() -> dict:
+def rogue_dhcp_suspects(
+    building_id: str | None = None,
+    site_id: str | None = None,
+) -> dict:
     try:
-        return _ops().get_rogue_dhcp_suspects()
+        return _ops().get_rogue_dhcp_suspects(building_id=building_id, site_id=site_id)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 

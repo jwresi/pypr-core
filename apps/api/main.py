@@ -5,6 +5,7 @@ from fastapi import FastAPI
 from apps.api.jake_router import router as jake_router
 from apps.api.graph_router import router as graph_router
 from apps.api.incident_router import router as incident_router
+from apps.api.noc_router import router as noc_router
 from packages.jake.incidents.store import init_incidents_table
 from packages.pypr.config import load_policy
 from packages.pypr.intervention import decide_intervention
@@ -31,6 +32,7 @@ app.include_router(slack_router)
 app.include_router(jake_router)
 app.include_router(graph_router)
 app.include_router(incident_router)
+app.include_router(noc_router)
 
 
 @app.on_event("startup")

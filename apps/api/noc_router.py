@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter
 
 from apps.api.jake_router import _ops
+from packages.jake.connectors import slack as slack_connector
 from packages.jake.graph.health import score_building, score_site
 from packages.jake.graph.topology import get_graph
 from packages.jake.incidents import store as incident_store
@@ -113,6 +114,13 @@ def briefing() -> dict:
             ],
         },
     }
+
+
+@router.post("/briefing/post-to-slack", summary="Post current NOC briefing to Slack")
+def post_briefing_to_slack() -> dict:
+    current_briefing = briefing()
+    ok = slack_connector.post_briefing(current_briefing)
+    return {"posted": ok, "channel": slack_connector._channel()}
 
 
 @router.get("/health-scores/{site_id}", summary="Risk scores for all buildings at a site")

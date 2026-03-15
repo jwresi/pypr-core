@@ -4,6 +4,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from apps.api.jake_router import _ops
+from packages.jake.connectors import slack as slack_connector
 from packages.jake.incidents.engine import correlate_from_jake, create_incident
 from packages.jake.incidents import store as incident_store
 
@@ -27,7 +28,9 @@ class NoteRequest(BaseModel):
 @router.post("/correlate", summary="Auto-correlate signals for a scope into an incident")
 def correlate(scope: str) -> dict:
     try:
-        return correlate_from_jake(scope, _ops())
+        incident = correlate_from_jake(scope, _ops())
+        slack_connector.post_incident_alert(incident)
+        return incident
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 

@@ -7,7 +7,7 @@ from typing import Any
 import yaml
 
 
-DEFAULT_POLICY_PATH = "pypr/config/constitution.yaml"
+DEFAULT_POLICY_PATH = "packages/pypr/config/constitution.yaml"
 
 
 @lru_cache(maxsize=1)

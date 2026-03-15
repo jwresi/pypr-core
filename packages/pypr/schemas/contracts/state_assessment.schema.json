@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "pypr/state_assessment",
+  "title": "StateAssessment",
+  "type": "object",
+  "required": ["entity_id", "entity_type", "state", "confidence", "evidence", "summary", "assessed_at"],
+  "properties": {
+    "entity_id": {"type": "string", "minLength": 1},
+    "entity_type": {"type": "string", "enum": ["customer", "device", "site", "service"]},
+    "state": {"type": "string", "enum": ["stable", "offline", "intermittent", "degraded", "unknown"]},
+    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+    "confidence_band": {"type": "string", "enum": ["low", "moderate", "high"]},
+    "evidence": {
+      "type": "array",
+      "items": {"type": "string"},
+      "minItems": 1
+    },
+    "failure_modes": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": [
+          "telemetry_absent",
+          "telemetry_sparse",
+          "signal_conflict",
+          "single_source_dominance",
+          "clock_skew",
+          "source_unavailable"
+        ]
+      },
+      "uniqueItems": true
+    },
+    "uncertainty": {"type": "string", "minLength": 1},
+    "summary": {"type": "string", "minLength": 1},
+    "assessed_at": {"type": "string", "format": "date-time"}
+  },
+  "additionalProperties": false
+}

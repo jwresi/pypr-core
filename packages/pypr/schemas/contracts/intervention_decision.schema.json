@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "pypr/intervention_decision",
+  "title": "InterventionDecision",
+  "type": "object",
+  "required": ["decision_id", "target", "level", "confidence", "message", "reasons", "issued_at"],
+  "properties": {
+    "decision_id": {"type": "string", "minLength": 1},
+    "target": {"type": "string", "minLength": 1},
+    "level": {"type": "string", "enum": ["silent", "nudge", "suggestion", "warning", "critical"]},
+    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+    "message": {"type": "string", "minLength": 1},
+    "reasons": {
+      "type": "array",
+      "items": {"type": "string"},
+      "minItems": 1
+    },
+    "attention_cost": {"type": "number", "minimum": 0, "maximum": 1},
+    "suppressed": {"type": "boolean"},
+    "issued_at": {"type": "string", "format": "date-time"}
+  },
+  "additionalProperties": false
+}

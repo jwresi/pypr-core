@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "pypr/confidence_assessment",
+  "title": "ConfidenceAssessment",
+  "type": "object",
+  "required": ["score", "band", "factors", "computed_at"],
+  "properties": {
+    "score": {"type": "number", "minimum": 0, "maximum": 1},
+    "band": {"type": "string", "enum": ["low", "moderate", "high"]},
+    "factors": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "weight", "direction"],
+        "properties": {
+          "name": {"type": "string", "minLength": 1},
+          "weight": {"type": "number"},
+          "direction": {"type": "string", "enum": ["positive", "negative"]},
+          "note": {"type": "string"}
+        },
+        "additionalProperties": false
+      },
+      "minItems": 1
+    },
+    "computed_at": {"type": "string", "format": "date-time"}
+  },
+  "additionalProperties": false
+}

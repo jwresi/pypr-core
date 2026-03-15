@@ -1,0 +1,38 @@
+{
+  "000007.055": {
+    "massingType": "tower",
+    "authoritativeFloors": 20,
+    "roofNodeLabel": "R01",
+    "roofNodeKind": "router",
+    "basementLabel": "Basement / aggr switch",
+    "switchFloorOverrides": {
+      "SW01": 0
+    }
+  },
+  "000007.058": {
+    "massingType": "midrise-slab",
+    "authoritativeFloors": 6,
+    "roofNodeLabel": "RFSW01",
+    "roofNodeKind": "roof-switch",
+    "basementLabel": "Ground / service level",
+    "switchFloorOverrides": {
+      "SW01": 1,
+      "SW02": 3,
+      "SW03": 5
+    }
+  },
+  "000007.004": {
+    "massingType": "midrise-slab",
+    "authoritativeFloors": 4,
+    "roofNodeLabel": "RFSW01",
+    "roofNodeKind": "roof-switch",
+    "basementLabel": "Ground / service level"
+  },
+  "000007.053": {
+    "massingType": "midrise-slab",
+    "authoritativeFloors": 4,
+    "roofNodeLabel": "RFSW01",
+    "roofNodeKind": "roof-switch",
+    "basementLabel": "Ground / service level"
+  }
+}

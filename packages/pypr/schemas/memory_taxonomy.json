@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PYPR Memory Taxonomy",
+  "type": "object",
+  "required": ["kind", "key", "value", "confidence", "source"],
+  "properties": {
+    "kind": {
+      "type": "string",
+      "enum": ["fact", "event", "pattern", "decision", "commitment"]
+    },
+    "key": {"type": "string", "minLength": 1},
+    "value": {"type": ["string", "object", "array", "number", "boolean"]},
+    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+    "source": {"type": "string", "minLength": 1},
+    "expires_at": {"type": "string", "format": "date-time"},
+    "tags": {
+      "type": "array",
+      "items": {"type": "string"}
+    }
+  }
+}

@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "pypr/signal_event",
+  "title": "SignalEvent",
+  "type": "object",
+  "required": ["signal_id", "customer_id", "source", "signal_type", "status", "observed_at"],
+  "properties": {
+    "signal_id": {"type": "string", "minLength": 1},
+    "customer_id": {"type": "string", "minLength": 1},
+    "source": {"type": "string", "minLength": 1},
+    "signal_type": {
+      "type": "string",
+      "enum": ["dhcp", "pppoe", "arp", "snmp", "syslog", "api", "slack", "config"]
+    },
+    "status": {"type": "string", "minLength": 1},
+    "observed_at": {"type": "string", "format": "date-time"},
+    "metadata": {"type": "object", "additionalProperties": true},
+    "quality": {
+      "type": "object",
+      "properties": {
+        "source_confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "is_delayed": {"type": "boolean"},
+        "delay_seconds": {"type": "number", "minimum": 0}
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

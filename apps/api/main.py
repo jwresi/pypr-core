@@ -4,6 +4,7 @@ from fastapi import FastAPI
 
 from apps.api.jake_router import router as jake_router
 from apps.api.graph_router import router as graph_router
+from apps.api.incident_router import router as incident_router
 from packages.pypr.config import load_policy
 from packages.pypr.intervention import decide_intervention
 from packages.pypr.memory import (
@@ -28,11 +29,23 @@ app = FastAPI(
 app.include_router(slack_router)
 app.include_router(jake_router)
 app.include_router(graph_router)
+app.include_router(incident_router)
 
 
 @app.on_event("startup")
 def startup() -> None:
     init_db()
+    try:
+        from apps.api.jake_router import _ops
+        from packages.jake.graph.topology import rebuild_graph
+
+        result = rebuild_graph(_ops())
+        print(
+            f"[startup] graph: {result['nodes']} nodes, "
+            f"{result['edges']} edges, {result['buildings']} buildings"
+        )
+    except Exception as exc:
+        print(f"[startup] graph build failed (non-fatal): {exc}")
 
 
 # ── platform health ────────────────────────────────────────────────────────────

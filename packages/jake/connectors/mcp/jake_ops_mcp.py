@@ -589,6 +589,10 @@ def infer_unit_port_candidates(
 REPO_ROOT = Path(__file__).resolve().parents[4]
 ARTIFACT_PORT_MAP = Path(os.environ.get("JAKE_PORT_MAP") or os.environ.get("JAKE_ARTIFACT_PORT_MAP") or str(REPO_ROOT / "artifacts" / "customer_port_map" / "customer_port_map.json"))
 ARTIFACT_TRANSPORT_RADIO_SCAN = Path(os.environ.get("JAKE_TRANSPORT_RADIO_SCAN") or os.environ.get("JAKE_ARTIFACT_TRANSPORT_RADIO_SCAN") or str(REPO_ROOT / "artifacts" / "transport_radio_scan" / "transport_radio_scan.json"))
+NETBOX_RENAME_PROPOSALS_CSV = Path(
+    os.environ.get("JAKE_NETBOX_RENAME_PROPOSALS")
+    or str(REPO_ROOT / "output" / "spreadsheet" / "netbox_targeted_rename_proposals.csv")
+)
 VILO_AUDIT_OUT_DIR = Path(os.environ.get("JAKE_VILO_AUDIT_DIR") or os.environ.get("JAKE_VILO_AUDIT_OUT_DIR") or str(REPO_ROOT / "output" / "vilo_audit"))
 TAUC_NYCHA_AUDIT_CSV = Path(os.environ.get("JAKE_TAUC_AUDIT_CSV", str(REPO_ROOT / "output/tauc_nycha_cpe_audit_latest.csv")))
 NYCHA_INFO_CSV = next(
@@ -610,11 +614,74 @@ DEVICE_LABEL_RE = re.compile(r"^\d{6}\.\d{3}\.[A-Z]+\d{2}$")
 # Use `None` when the address should remain unresolved until a canonical NetBox prefix exists.
 ADDRESS_RESOLUTION_OVERRIDES: dict[str, dict[str, Any] | None] = {
     normalize_free_text("726 Fenimore St, Brooklyn, NY 11203"): None,
+    normalize_free_text("225 Buffalo Ave, Brooklyn, NY 11213"): None,
+    normalize_free_text("508 Howard Ave, Brooklyn, NY 11233"): None,
+    normalize_free_text("545 Ralph Ave, Brooklyn, NY 11233"): None,
+    normalize_free_text("1371 St Marks Ave, Brooklyn, NY 11233"): None,
+    normalize_free_text("1640 Sterling Pl, Brooklyn, NY 11233"): None,
+    normalize_free_text("1691 St Johns Pl, Brooklyn, NY 11233"): None,
+    normalize_free_text("1724 Sterling Pl, Brooklyn, NY 11233"): None,
+    normalize_free_text("1767 Sterling Pl, Brooklyn, NY 11233"): None,
 }
 
 # Explicit topology edges should be avoided unless there is no other authoritative source.
 # cnWave peer links are now expected to come from exporter metrics when configured.
-RADIO_LINK_OVERRIDES: list[dict[str, Any]] = []
+def load_radio_link_overrides() -> list[dict[str, Any]]:
+    if not NETBOX_RENAME_PROPOSALS_CSV.exists():
+        return []
+    try:
+        with NETBOX_RENAME_PROPOSALS_CSV.open(newline="", encoding="utf-8-sig") as handle:
+            rows = list(csv.DictReader(handle))
+    except Exception:
+        return []
+
+    link_rows = [
+        row
+        for row in rows
+        if str(row.get("site_code") or "") == "000007"
+        and str(row.get("model") or "").startswith("EH-")
+        and " - " in str(row.get("current_name") or "")
+        and str(row.get("confidence") or "").lower() == "high"
+        and str(row.get("proposed_prefix") or "").strip()
+    ]
+    if not link_rows:
+        return []
+
+    by_left_label: dict[str, dict[str, str]] = {}
+    for row in link_rows:
+        left, right = [part.strip() for part in str(row.get("current_name") or "").split(" - ", 1)]
+        by_left_label[normalize_free_text(left)] = {
+            "left": left,
+            "right": right,
+            "building_id": canonical_scope(row.get("proposed_prefix")),
+            "name": str(row.get("current_name") or ""),
+        }
+
+    overrides: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for row in link_rows:
+        left, right = [part.strip() for part in str(row.get("current_name") or "").split(" - ", 1)]
+        pair_key = tuple(sorted((normalize_free_text(left), normalize_free_text(right))))
+        if pair_key in seen:
+            continue
+        seen.add(pair_key)
+        reverse = by_left_label.get(normalize_free_text(right))
+        overrides.append(
+            {
+                "name": str(row.get("current_name") or f"{left} - {right}"),
+                "kind": "cambium",
+                "from_name": left,
+                "to_name": right,
+                "from_building_id": canonical_scope(row.get("proposed_prefix")),
+                "to_building_id": reverse.get("building_id") if reverse else None,
+                "status": "ok",
+                "evidence_source": "rename_sheet_override",
+            }
+        )
+    return overrides
+
+
+RADIO_LINK_OVERRIDES: list[dict[str, Any]] = load_radio_link_overrides()
 
 
 def load_customer_port_map() -> dict[str, Any]:
@@ -791,6 +858,7 @@ class JakeOps:
 
         self._netbox_devices_cache: list[dict[str, Any]] | None = None
         self._location_prefix_index_cache: list[dict[str, Any]] | None = None
+        self._site_address_inventory_cache: dict[str, dict[str, Any]] = {}
 
     def latest_scan_id(self) -> int:
         row = self.db.execute("select max(id) as id from scans").fetchone()
@@ -951,6 +1019,100 @@ class JakeOps:
             "best_match": best,
             "candidates": candidates[:10],
         }
+
+    def _site_address_inventory(self, site_id: str) -> dict[str, Any]:
+        site_id = canonical_scope(site_id)
+        cached = self._site_address_inventory_cache.get(site_id)
+        if cached is not None:
+            return cached
+
+        address_units: dict[str, dict[str, Any]] = {}
+        building_units: dict[str, set[str]] = {}
+        resolved_address_cache: dict[str, str | None] = {}
+
+        def resolve_building_id_for_address(address: str) -> str | None:
+            normalized = str(address or "").strip()
+            if not normalized:
+                return None
+            if normalized not in resolved_address_cache:
+                resolved = self._resolve_building_from_address(normalized)
+                best = (resolved or {}).get("best_match") or {}
+                resolved_prefix = canonical_scope(best.get("prefix"))
+                if resolved_prefix and not identity_matches_scope(resolved_prefix, site_id):
+                    resolved_prefix = None
+                resolved_address_cache[normalized] = resolved_prefix
+            return resolved_address_cache[normalized]
+
+        def ensure_address_entry(address: str, building_id: str | None = None) -> dict[str, Any]:
+            normalized = str(address or "").strip()
+            entry = address_units.setdefault(
+                normalized,
+                {
+                    "address": normalized,
+                    "building_id": building_id,
+                    "units": set(),
+                    "network_names": set(),
+                },
+            )
+            if building_id and not entry.get("building_id"):
+                entry["building_id"] = building_id
+            return entry
+
+        def add_address_unit(
+            address: str,
+            unit: str | None,
+            network_name: str | None,
+            building_id: str | None = None,
+        ) -> None:
+            normalized_address = str(address or "").strip()
+            if not normalized_address:
+                return
+            resolved_building_id = canonical_scope(building_id) if building_id else resolve_building_id_for_address(normalized_address)
+            if resolved_building_id and not identity_matches_scope(resolved_building_id, site_id):
+                return
+            if not resolved_building_id:
+                return
+            entry = ensure_address_entry(normalized_address, resolved_building_id)
+            if unit:
+                entry["units"].add(unit)
+                building_units.setdefault(resolved_building_id, set()).add(unit)
+            normalized_network_name = str(network_name or "").strip()
+            if normalized_network_name:
+                entry["network_names"].add(normalized_network_name)
+
+        for row in load_nycha_info_rows():
+            address = str(row.get("Address") or "").strip()
+            unit = parse_unit_token(row.get("Unit"))
+            network_name = str(row.get("PPPoE") or "").strip()
+            if address:
+                add_address_unit(address, unit, network_name)
+
+        for row in load_tauc_nycha_audit_rows():
+            location = str(row.get("expected_location") or "").strip()
+            unit = parse_unit_token(row.get("expected_unit"))
+            prefix = canonical_scope(row.get("expected_prefix"))
+            network_name = str(row.get("networkName") or "").strip()
+            if location:
+                add_address_unit(location, unit, network_name, prefix)
+
+        # Seed every NetBox-backed site location into the inventory even when
+        # there is no NYCHA/TAUC unit evidence yet. This keeps switch-only
+        # sites present in the topology/map.
+        for row in self._location_prefix_index():
+            prefix = canonical_scope(row.get("prefix"))
+            if not prefix or not identity_matches_scope(prefix, site_id):
+                continue
+            location = str(row.get("location") or "").strip()
+            if not location:
+                continue
+            ensure_address_entry(location, prefix)
+
+        inventory = {
+            "address_units": address_units,
+            "building_units": building_units,
+        }
+        self._site_address_inventory_cache[site_id] = inventory
+        return inventory
 
     def _label_audit_rows(self, rows: list[dict[str, Any]], source: str) -> dict[str, Any]:
         invalid = []
@@ -1598,71 +1760,14 @@ class JakeOps:
     def get_site_topology(self, site_id: str) -> dict[str, Any]:
         radio_scan = load_transport_radio_scan()
         alerts = self._alerts_for_site(site_id) if self.alerts else []
-        tauc_rows = load_tauc_nycha_audit_rows()
-        nycha_info_rows = load_nycha_info_rows()
-        address_units: dict[str, dict[str, Any]] = {}
-        building_units: dict[str, set[str]] = {}
-        resolved_address_cache: dict[str, str | None] = {}
-
-        def resolve_building_id_for_address(address: str) -> str | None:
-            normalized = str(address or "").strip()
-            if not normalized:
-                return None
-            if normalized not in resolved_address_cache:
-                resolved = self._resolve_building_from_address(normalized)
-                best = (resolved or {}).get("best_match") or {}
-                resolved_address_cache[normalized] = canonical_scope(best.get("prefix"))
-            return resolved_address_cache[normalized]
-
-        def ensure_address_entry(address: str, building_id: str | None = None) -> dict[str, Any]:
-            normalized = str(address or "").strip()
-            entry = address_units.setdefault(
-                normalized,
-                {
-                    "address": normalized,
-                    "building_id": building_id,
-                    "units": set(),
-                    "network_names": set(),
-                },
-            )
-            if building_id and not entry.get("building_id"):
-                entry["building_id"] = building_id
-            return entry
-
-        def add_address_unit(address: str, unit: str | None, network_name: str | None, building_id: str | None = None) -> None:
-            normalized_address = str(address or "").strip()
-            if not normalized_address:
-                return
-            resolved_building_id = canonical_scope(building_id) if building_id else resolve_building_id_for_address(normalized_address)
-            entry = ensure_address_entry(normalized_address, resolved_building_id)
-            if unit:
-                entry["units"].add(unit)
-                if resolved_building_id:
-                    building_units.setdefault(resolved_building_id, set()).add(unit)
-            normalized_network_name = str(network_name or "").strip()
-            if normalized_network_name:
-                entry["network_names"].add(normalized_network_name)
-
-        for row in nycha_info_rows:
-            address = str(row.get("Address") or "").strip()
-            unit = parse_unit_token(row.get("Unit"))
-            network_name = str(row.get("PPPoE") or "").strip()
-            if not address:
-                continue
-            add_address_unit(address, unit, network_name)
-
-        for row in tauc_rows:
-            location = str(row.get("expected_location") or "").strip()
-            unit = parse_unit_token(row.get("expected_unit"))
-            prefix = canonical_scope(row.get("expected_prefix"))
-            network_name = str(row.get("networkName") or "").strip()
-            if not location:
-                continue
-            add_address_unit(location, unit, network_name, prefix)
+        address_inventory = self._site_address_inventory(site_id)
+        address_units: dict[str, dict[str, Any]] = address_inventory["address_units"]
+        building_units: dict[str, set[str]] = address_inventory["building_units"]
 
         radios: list[dict[str, Any]] = []
         radio_links: list[dict[str, Any]] = []
         radio_name_to_building_id: dict[str, str] = {}
+        siklu_label_to_building_id: dict[str, str] = {}
         address_coords: dict[str, tuple[float, float]] = {}
         building_coords: dict[str, tuple[float, float]] = {}
         for row in radio_scan.get("results") or []:
@@ -1697,11 +1802,15 @@ class JakeOps:
                         "kind": "siklu",
                         "from_label": left,
                         "to_label": right,
+                        "from_building_id": building_id,
                         "status": row.get("status"),
                         "ip": row.get("ip"),
                         "location": location,
+                        "evidence_source": "siklu_transport_scan",
                     }
                 )
+                if building_id:
+                    siklu_label_to_building_id[normalize_free_text(left)] = building_id
             if building_id:
                 radio_name_to_building_id[name] = building_id
             radios.append(
@@ -1724,6 +1833,18 @@ class JakeOps:
                 }
             )
 
+        for link in radio_links:
+            if str(link.get("kind") or "").lower() != "siklu":
+                continue
+            if not link.get("from_building_id"):
+                link["from_building_id"] = siklu_label_to_building_id.get(
+                    normalize_free_text(str(link.get("from_label") or ""))
+                )
+            if not link.get("to_building_id"):
+                link["to_building_id"] = siklu_label_to_building_id.get(
+                    normalize_free_text(str(link.get("to_label") or ""))
+                )
+
         for link in self._cnwave_site_links(site_id):
             radio_links.append(
                 {
@@ -1740,14 +1861,58 @@ class JakeOps:
                     "kind": override["kind"],
                     "from_label": override.get("from_name"),
                     "to_label": override.get("to_name"),
-                    "from_building_id": radio_name_to_building_id.get(str(override.get("from_name") or "")),
-                    "to_building_id": radio_name_to_building_id.get(str(override.get("to_name") or "")),
+                    "from_building_id": override.get("from_building_id") or radio_name_to_building_id.get(str(override.get("from_name") or "")),
+                    "to_building_id": override.get("to_building_id") or radio_name_to_building_id.get(str(override.get("to_name") or "")),
                     "status": override.get("status"),
+                    "evidence_source": override.get("evidence_source"),
                 }
             )
 
+        source_rank = {
+            "siklu_transport_scan": 0,
+            "cnwave_exporter": 0,
+            "transport_scan_neighbor": 1,
+            "rename_sheet_override": 2,
+        }
+
+        def normalized_link_label(label: str) -> str:
+            cleaned = re.sub(r"\s+(v\d{3,}|eh-\S+)$", "", str(label or "").strip(), flags=re.IGNORECASE)
+            return normalize_free_text(cleaned)
+
+        deduped_links: list[dict[str, Any]] = []
+        link_index_by_pair: dict[tuple[str, str], int] = {}
+        for link in radio_links:
+            left = normalized_link_label(str(link.get("from_label") or ""))
+            right = normalized_link_label(str(link.get("to_label") or ""))
+            if not left or not right:
+                deduped_links.append(link)
+                continue
+            pair_key = tuple(sorted((left, right)))
+            rank = source_rank.get(str(link.get("evidence_source") or ""), 3)
+            existing_index = link_index_by_pair.get(pair_key)
+            if existing_index is None:
+                link_index_by_pair[pair_key] = len(deduped_links)
+                deduped_links.append(link)
+                continue
+            existing_rank = source_rank.get(str(deduped_links[existing_index].get("evidence_source") or ""), 3)
+            if rank < existing_rank:
+                deduped_links[existing_index] = link
+        radio_links = deduped_links
+
         buildings: list[dict[str, Any]] = []
-        seen_buildings = sorted({r.get("resolved_building_id") for r in radios if r.get("resolved_building_id")})
+        seen_buildings = sorted(
+            {
+                canonical_scope(entry.get("building_id"))
+                for entry in address_units.values()
+                if entry.get("building_id")
+            }
+            | {
+                canonical_scope(r.get("resolved_building_id"))
+                for r in radios
+                if r.get("resolved_building_id")
+            }
+            | set(building_units.keys())
+        )
         for building_id in seen_buildings:
             buildings.append(
                 {
@@ -1814,8 +1979,20 @@ class JakeOps:
 
     def _building_address_record(self, building_id: str) -> dict[str, Any] | None:
         site_id = canonical_scope(building_id.split(".")[0])
-        topology = self.get_site_topology(site_id)
-        return next((row for row in (topology.get("addresses") or []) if canonical_scope(row.get("building_id")) == canonical_scope(building_id)), None)
+        inventory = self._site_address_inventory(site_id)
+        canonical_building_id = canonical_scope(building_id)
+        for address, entry in sorted(inventory["address_units"].items()):
+            if canonical_scope(entry.get("building_id")) != canonical_building_id:
+                continue
+            return {
+                "address": address,
+                "building_id": canonical_building_id,
+                "units": sorted(entry.get("units") or []),
+                "network_names": sorted(entry.get("network_names") or []),
+                "latitude": None,
+                "longitude": None,
+            }
+        return None
 
     def _exact_unit_port_matches(self, building_id: str) -> list[dict[str, Any]]:
         building_id = canonical_scope(building_id)

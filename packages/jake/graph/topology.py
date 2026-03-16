@@ -65,14 +65,16 @@ class TopologyGraph:
                 g.add_edge(building_id, site_id, type="MEMBER_OF")
             if building_id:
                 g.add_edge(identity, building_id, type="MEMBER_OF")
+        scan_id = None
+        try:
+            scan_id = ops.latest_scan_id()
+        except Exception:
+            scan_id = None
         for building_id in buildings_seen:
-            try:
-                model = ops.get_building_model(building_id)
-            except Exception:
-                continue
-            if model.get("address"):
-                g.nodes[building_id]["address"] = model["address"]
-            for edge in model.get("direct_neighbor_edges") or []:
+            address_record = self._get_building_address_record(ops, building_id)
+            if address_record and address_record.get("address"):
+                g.nodes[building_id]["address"] = address_record["address"]
+            for edge in self._direct_neighbor_edges_for_building(ops, scan_id, building_id):
                 src = edge.get("from_identity")
                 dst = edge.get("to_identity")
                 if not src or not dst:
@@ -108,6 +110,72 @@ class TopologyGraph:
             "buildings": len(buildings_seen),
             "edges_from_lldp": edges_added,
         }
+
+    def _get_building_address_record(self, ops, building_id):
+        try:
+            return ops._building_address_record(building_id)
+        except Exception:
+            return None
+
+    def _direct_neighbor_edges_for_building(self, ops, scan_id, building_id):
+        if scan_id is None:
+            return []
+        try:
+            device_rows = ops.db.execute(
+                """
+                select identity, ip
+                from devices
+                where scan_id=? and identity like ? and ip is not null and ip != ''
+                order by identity
+                """,
+                (scan_id, f"{building_id}%"),
+            ).fetchall()
+        except Exception:
+            return []
+
+        edges = []
+        seen = set()
+        for row in device_rows:
+            identity = str(row["identity"] or "")
+            ip = str(row["ip"] or "")
+            if not identity or not ip:
+                continue
+            try:
+                neighbor_rows = ops.db.execute(
+                    """
+                    select interface, neighbor_identity, neighbor_address, platform, version
+                    from neighbors
+                    where scan_id=? and ip=?
+                    order by interface, neighbor_identity
+                    """,
+                    (scan_id, ip),
+                ).fetchall()
+            except Exception:
+                continue
+            for neighbor in neighbor_rows:
+                interface = str(neighbor["interface"] or "")
+                if not interface or not interface.lower().startswith(("ether", "sfp", "gig", "ten", "et")):
+                    continue
+                neighbor_identity = str(neighbor["neighbor_identity"] or "")
+                if not neighbor_identity:
+                    continue
+                from_identity = identity
+                to_identity = neighbor_identity
+                dedupe_key = (from_identity, interface.split(",", 1)[0], to_identity)
+                if dedupe_key in seen:
+                    continue
+                seen.add(dedupe_key)
+                edges.append(
+                    {
+                        "from_identity": from_identity,
+                        "from_interface": interface.split(",", 1)[0],
+                        "to_identity": to_identity,
+                        "neighbor_address": neighbor["neighbor_address"],
+                        "platform": neighbor["platform"],
+                        "version": neighbor["version"],
+                    }
+                )
+        return edges
 
     @property
     def g(self):

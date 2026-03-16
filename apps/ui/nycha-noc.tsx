@@ -306,6 +306,8 @@ type RadioLive = RadioLayout & {
   status: Status;
   alert?: JakeAlert | null;
   knownUnits?: string[];
+  latitude?: number | null;
+  longitude?: number | null;
 };
 
 type PortWithStatus = PortRecord & {
@@ -435,6 +437,33 @@ const BUILDING_LAYOUTS: BuildingLayout[] = [
   },
 ];
 
+const LEGACY_TRANSPORT_LINKS: LinkDef[] = [
+  {
+    from: "000007.055",
+    to: "000007.058",
+    strength: "strong",
+    freq: "5.8GHz",
+    model: "Legacy transport",
+    kind: "Fallback transport",
+  },
+  {
+    from: "000007.058",
+    to: "000007.004",
+    strength: "medium",
+    freq: "5.8GHz",
+    model: "Legacy transport",
+    kind: "Fallback transport",
+  },
+  {
+    from: "000007.004",
+    to: "000007.053",
+    strength: "medium",
+    freq: "5.8GHz",
+    model: "Legacy transport",
+    kind: "Fallback transport",
+  },
+];
+
 const DEFAULT_JAKE_BASE_URL =
   typeof window !== "undefined" && window.location.port === "8787"
     ? window.location.origin
@@ -444,6 +473,42 @@ const UI_STATE_STORAGE_KEY = "nycha-noc-ui-state-v1";
 const BUILDING_DATA_BATCH_SIZE = 6;
 
 const BUILDING_PROFILES = buildingProfiles as Record<string, BuildingProfile>;
+const STATIC_SITE_COORDS = siteCoords as Record<string, SiteCoord>;
+const LEGACY_LAYOUT_BY_SOURCE_ID = new Map(BUILDING_LAYOUTS.map((layout) => [layout.sourceBuildingId, layout]));
+
+function normalizeAddressKey(value: string) {
+  return value
+    .toLowerCase()
+    .replace(/\beast\b/g, "e")
+    .replace(/\bwest\b/g, "w")
+    .replace(/\bavenue\b/g, "ave")
+    .replace(/\bstreet\b/g, "st")
+    .replace(/\broad\b/g, "rd")
+    .replace(/\bplace\b/g, "pl")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+function addressStemKey(value: string) {
+  const base = value.split(",")[0]?.trim() ?? value;
+  return base
+    .toLowerCase()
+    .replace(/\beast\b/g, "e")
+    .replace(/\bwest\b/g, "w")
+    .replace(/\bavenue\b/g, "ave")
+    .replace(/\bstreet\b/g, "st")
+    .replace(/\broad\b/g, "rd")
+    .replace(/\bplace\b/g, "pl")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+const STATIC_SITE_COORDS_BY_NORMALIZED = new Map(
+  Object.entries(STATIC_SITE_COORDS).map(([address, coord]) => [normalizeAddressKey(address), coord]),
+);
+const STATIC_SITE_COORDS_BY_STEM = new Map(
+  Object.entries(STATIC_SITE_COORDS).map(([address, coord]) => [addressStemKey(address), coord]),
+);
 
 function ifaceLabel(iface?: string | null) {
   return iface && iface.trim() ? iface : "unknown";
@@ -520,6 +585,27 @@ function buildingMatchesEndpoint(building: Pick<BuildingLayout, "name" | "shortL
   return false;
 }
 
+function findMatchingBuilding(
+  buildings: Array<Pick<BuildingLayout, "id" | "sourceBuildingId" | "name" | "shortLabel" | "address"> & { status?: Status }>,
+  label?: string | null,
+  buildingId?: string | null,
+  location?: string | null,
+) {
+  if (buildingId) {
+    const exact = buildings.find((building) => canonicalBuildingIdOf(building) === buildingId);
+    if (exact) return exact;
+  }
+  const candidates = buildingId
+    ? buildings.filter((building) => canonicalBuildingIdOf(building) === buildingId)
+    : buildings;
+  if (!candidates.length) return null;
+  const exactLocation = location
+    ? candidates.find((building) => normalizeSiteToken(building.address) === normalizeSiteToken(location))
+    : null;
+  if (exactLocation) return exactLocation;
+  return candidates.find((building) => buildingMatchesEndpoint(building, label, location)) ?? null;
+}
+
 function radioMatchesEndpoint(radio: Pick<RadioLive, "name" | "shortLabel" | "address">, label?: string | null, location?: string | null) {
   const radioTokens = [
     normalizeSiteToken(radio.name),
@@ -542,6 +628,55 @@ function inferFloorsFromUnits(units: string[]) {
 
 function canonicalBuildingIdOf(building: Pick<BuildingLayout, "id" | "sourceBuildingId">) {
   return building.sourceBuildingId || building.id;
+}
+
+function buildingIdFromIdentity(identity?: string | null) {
+  const match = String(identity || "").match(/^(\d{6}\.\d{3})\./);
+  return match ? match[1] : null;
+}
+
+function isSwitchLikeIdentity(identity?: string | null) {
+  return /\.(?:AG|SW|RFSW|R)\d*/i.test(String(identity || ""));
+}
+
+function compoundSiteContext(building: BuildingLive, allBuildings: BuildingLive[]) {
+  const localBuildingId = canonicalBuildingIdOf(building);
+  const edges = building.buildingModel?.direct_neighbor_edges ?? [];
+  const localSwitches = new Set(
+    [
+      ...(building.buildingModel?.switches.map((entry) => entry.identity) ?? []),
+      ...(building.buildingHealth?.devices.map((entry) => entry.identity) ?? []),
+    ].filter((identity) => isSwitchLikeIdentity(identity)),
+  );
+  const downstreamBySwitch = new Map<string, Set<string>>();
+  for (const edge of edges) {
+    if (!localSwitches.has(edge.from_identity) || !isSwitchLikeIdentity(edge.to_identity)) continue;
+    const remoteBuildingId = buildingIdFromIdentity(edge.to_identity);
+    if (!remoteBuildingId || remoteBuildingId === localBuildingId) continue;
+    const rows = downstreamBySwitch.get(edge.from_identity) ?? new Set<string>();
+    rows.add(remoteBuildingId);
+    downstreamBySwitch.set(edge.from_identity, rows);
+  }
+  const ranked = [...downstreamBySwitch.entries()]
+    .map(([switchIdentity, downstream]) => ({ switchIdentity, downstream: [...downstream] }))
+    .sort((a, b) => {
+      const aRank = a.switchIdentity.includes(".AG") ? 2 : a.switchIdentity.includes("RFSW") ? 1 : 0;
+      const bRank = b.switchIdentity.includes(".AG") ? 2 : b.switchIdentity.includes("RFSW") ? 1 : 0;
+      return b.downstream.length - a.downstream.length || bRank - aRank || a.switchIdentity.localeCompare(b.switchIdentity);
+    });
+  const selected = ranked[0];
+  if (!selected || selected.downstream.length === 0) return null;
+  const members = selected.downstream
+    .map((buildingId) => allBuildings.find((entry) => canonicalBuildingIdOf(entry) === buildingId))
+    .filter(isPresent)
+    .slice(0, 3);
+  if (!members.length) return null;
+  return {
+    rootSwitchIdentity: selected.switchIdentity,
+    mode: selected.switchIdentity.includes(".AG") ? "agg-fed branch site" : "switch-fed branch site",
+    cluster: [building, ...members],
+    downstreamCount: selected.downstream.length,
+  };
 }
 
 function addressLayoutId(address: string, sourceBuildingId: string, duplicateCount: number) {
@@ -673,6 +808,8 @@ function arcLineCoordinates(start: [number, number], end: [number, number]): [nu
   const dy = end[1] - start[1];
   const distance = Math.hypot(dx, dy);
   if (!Number.isFinite(distance) || distance === 0) return [start, end];
+  // Short rooftop hops look wrong as arcs; render them as straight segments.
+  if (distance < 0.0007) return [start, end];
   const normalX = -dy / distance;
   const normalY = dx / distance;
   const offset = Math.min(distance * 0.65, 0.001);
@@ -761,9 +898,43 @@ function getCoord(address: string, siteTopology?: SiteTopology | null, buildingI
       if (buildingCoord?.latitude != null && buildingCoord.longitude != null) {
         return { lat: buildingCoord.latitude, lon: buildingCoord.longitude };
       }
+      const buildingRadioCoord = (siteTopology.radios ?? []).find(
+        (radio) => radio.resolved_building_id === buildingId && radio.latitude != null && radio.longitude != null,
+      );
+      if (buildingRadioCoord?.latitude != null && buildingRadioCoord.longitude != null) {
+        return { lat: buildingRadioCoord.latitude, lon: buildingRadioCoord.longitude };
+      }
     }
   }
-  return (siteCoords as Record<string, SiteCoord>)[address] ?? null;
+  const exactStatic = STATIC_SITE_COORDS[address];
+  if (exactStatic) return exactStatic;
+
+  const normalizedStatic = STATIC_SITE_COORDS_BY_NORMALIZED.get(normalizeAddressKey(address));
+  if (normalizedStatic) return normalizedStatic;
+
+  const stemStatic = STATIC_SITE_COORDS_BY_STEM.get(addressStemKey(address));
+  if (stemStatic) return stemStatic;
+
+  if (buildingId) {
+    const legacy = LEGACY_LAYOUT_BY_SOURCE_ID.get(buildingId);
+    if (legacy) {
+      const legacyExact = STATIC_SITE_COORDS[legacy.address];
+      if (legacyExact) return legacyExact;
+      const legacyNormalized = STATIC_SITE_COORDS_BY_NORMALIZED.get(normalizeAddressKey(legacy.address));
+      if (legacyNormalized) return legacyNormalized;
+      const legacyStem = STATIC_SITE_COORDS_BY_STEM.get(addressStemKey(legacy.address));
+      if (legacyStem) return legacyStem;
+    }
+  }
+
+  return null;
+}
+
+function radioCoord(radio: Pick<RadioLive, "latitude" | "longitude" | "address" | "anchorBuildingId">, siteTopology?: SiteTopology | null) {
+  if (radio.latitude != null && radio.longitude != null) {
+    return { lat: radio.latitude, lon: radio.longitude };
+  }
+  return getCoord(radio.address, siteTopology, radio.anchorBuildingId);
 }
 
 function distanceBetweenCoords(
@@ -896,8 +1067,18 @@ function floorNumber(unit: string) {
   return match ? Number(match[1]) : 0;
 }
 
+function unitFaceColor(unit: Pick<UnitBox, "status" | "port" | "inferred">) {
+  if (unit.status === "online" && !unit.port && unit.inferred) return "#60a5fa";
+  return STATUS_COLOR[unit.status];
+}
+
+function unitStatusLabel(unit: Pick<UnitBox, "status" | "port" | "inferred">) {
+  if (unit.status === "online" && !unit.port && unit.inferred) return "inferred online";
+  return humanStatus(unit.status);
+}
+
 function UnitPrismButton({ unit, selected, onSelectUnit, onInspectPort, compact = false }: UnitPrismProps) {
-  const face = STATUS_COLOR[unit.status];
+  const face = unitFaceColor(unit);
   const topFill = `${face}80`;
   const sideFill = `${face}66`;
   const edge = selected ? "#f8fafc" : "rgba(148,163,184,0.72)";
@@ -1202,6 +1383,55 @@ function buildTopologyGraph(building: BuildingLive, devices: BuildingHealth["dev
   return { rootId, nodes, edges, levels };
 }
 
+function buildLocalSwitchChain(building: BuildingLive, devices: BuildingHealth["devices"]) {
+  const localIds = new Set(
+    [
+      ...(building.buildingModel?.switches.map((entry) => entry.identity) ?? []),
+      ...devices.map((entry) => entry.identity),
+    ].filter((identity) => isSwitchLikeIdentity(identity)),
+  );
+  if (!localIds.size) return [];
+
+  const adjacency = new Map<string, Set<string>>();
+  for (const identity of localIds) adjacency.set(identity, new Set<string>());
+  for (const edge of building.buildingModel?.direct_neighbor_edges ?? []) {
+    if (!localIds.has(edge.from_identity) || !localIds.has(edge.to_identity)) continue;
+    adjacency.get(edge.from_identity)?.add(edge.to_identity);
+    adjacency.get(edge.to_identity)?.add(edge.from_identity);
+  }
+
+  const rank = (identity: string) => {
+    if (identity.includes(".RFSW")) return 0;
+    if (identity.includes(".R01")) return 1;
+    const sw = identity.match(/\.SW(\d+)/i);
+    if (sw) return 10 + Number(sw[1]);
+    const ag = identity.match(/\.AG(\d+)/i);
+    if (ag) return 100 + Number(ag[1]);
+    return 1000;
+  };
+
+  const nodes = [...localIds].sort((a, b) => rank(a) - rank(b) || a.localeCompare(b));
+  const root = nodes[0];
+  const chain = [root];
+  const visited = new Set(chain);
+  let current = root;
+
+  while (true) {
+    const next = [...(adjacency.get(current) ?? [])]
+      .filter((identity) => !visited.has(identity))
+      .sort((a, b) => rank(a) - rank(b) || a.localeCompare(b))[0];
+    if (!next) break;
+    chain.push(next);
+    visited.add(next);
+    current = next;
+  }
+
+  for (const identity of nodes) {
+    if (!visited.has(identity)) chain.push(identity);
+  }
+  return chain;
+}
+
 function parseAddressStem(address: string) {
   const base = shortAddressLabel(address).split(",")[0]?.trim() ?? address;
   const match = base.match(/^(\d+)\s+(.+)$/);
@@ -1321,7 +1551,7 @@ function CompactBuildingThumbnail({
                       ],
                     })}
                     onMouseLeave={() => onHoverCard(null)}
-                    style={{ border: "1px solid #64748b", background: `${STATUS_COLOR[unit.status]}55`, color: "#f8fafc", fontSize: 8, fontWeight: 700, textAlign: "center", padding: "6px 0" }}
+                    style={{ border: "1px solid #64748b", background: `${unitFaceColor(unit)}55`, color: "#f8fafc", fontSize: 8, fontWeight: 700, textAlign: "center", padding: "6px 0" }}
                   >
                     {unit.unit}
                   </div>
@@ -1370,23 +1600,13 @@ function CompoundSiteDiagram({
   onOpenBuilding: (buildingId: string) => void;
 }) {
   const [hoverCard, setHoverCard] = useState<HoverCardData | null>(null);
-  const current = parseAddressStem(building.address);
-  const siblings = allBuildings
-    .filter((candidate) => candidate.id !== building.id)
-    .filter((candidate) => {
-      const parsed = parseAddressStem(candidate.address);
-      if (!current.street || parsed.street !== current.street) return false;
-      if (current.number == null || parsed.number == null) return false;
-      return Math.abs(parsed.number - current.number) <= 30;
-    })
-    .sort((a, b) => Math.abs((parseAddressStem(a.address).number ?? 0) - (current.number ?? 0)) - Math.abs((parseAddressStem(b.address).number ?? 0) - (current.number ?? 0)))
-    .slice(0, 3);
-  const cluster = [building, ...siblings].slice(0, 4);
-  const clusterRoot = cluster.find((candidate) =>
-    (candidate.buildingModel?.switches ?? []).some((entry) => entry.identity.includes(".AG")) || (candidate.buildingModel?.radios?.length ?? 0) > 0,
-  ) ?? building;
-  const agSwitch = clusterRoot.buildingModel?.switches.find((entry) => entry.identity.includes(".AG"))
-    ?? clusterRoot.buildingHealth?.devices.find((entry) => entry.identity.includes(".AG"));
+  const context = compoundSiteContext(building, allBuildings);
+  const cluster = context?.cluster ?? [building];
+  const clusterRoot = cluster[0];
+  const agSwitch = context
+    ? clusterRoot.buildingModel?.switches.find((entry) => entry.identity === context.rootSwitchIdentity)
+      ?? clusterRoot.buildingHealth?.devices.find((entry) => entry.identity === context.rootSwitchIdentity)
+    : null;
   const topologyRadio = radios.find((radio) => radio.anchorBuildingId === clusterRoot.id || radio.anchorBuildingId === canonicalBuildingIdOf(clusterRoot));
   const effectiveRadio = selectedRadio
     ? selectedRadio
@@ -1408,7 +1628,7 @@ function CompoundSiteDiagram({
       : topologyRadio
         ? topologyRadio
       : null;
-  if (!effectiveRadio || !agSwitch || cluster.length < 2) return null;
+  if (!effectiveRadio || !agSwitch || cluster.length < 2 || !context) return null;
 
   return (
     <div style={{ position: "relative", background: "#020617", border: "1px solid #1e293b", borderRadius: 10, padding: 14, marginBottom: 16 }}>
@@ -1465,11 +1685,11 @@ function CompoundSiteDiagram({
           <div
             onMouseEnter={() => setHoverCard({
               title: agSwitch.identity,
-              subtitle: "Aggregation switch",
+              subtitle: context.mode === "agg-fed branch site" ? "Aggregation switch" : "Distribution switch",
               facts: [
                 { label: "IP", value: agSwitch.ip || "n/a" },
                 { label: "MAC", value: "n/a" },
-                { label: "Neighbors", value: String((building.buildingModel?.direct_neighbor_edges ?? []).filter((edge) => edge.to_identity === agSwitch.identity || edge.from_identity === agSwitch.identity).length) },
+                { label: "Downstream sites", value: String(context.downstreamCount) },
                 { label: "Units", value: String(clusterRoot.knownUnits.length) },
               ],
             })}
@@ -1482,7 +1702,7 @@ function CompoundSiteDiagram({
           <div style={{ fontSize: 10, color: "#94a3b8", textAlign: "center" }}>
             {effectiveRadio.name}
             <br />
-            {clusterRoot.buildingModel?.direct_neighbor_edges.filter((edge) => edge.to_identity === agSwitch.identity || edge.to_identity.includes(".AG")).length ? "agg-fed branch site" : "relay-fed branch site"}
+            {context.mode}
           </div>
         </div>
         <div style={{ display: "grid", gap: 14 }}>
@@ -1555,6 +1775,7 @@ function WireframeTwinView({
   selectedUnit,
   onSelectUnit,
   onInspectPort,
+  onOpenDevice,
   selectedRadio,
   roofSwitches,
   accessSwitches,
@@ -1565,12 +1786,14 @@ function WireframeTwinView({
   selectedUnit: UnitBox | null;
   onSelectUnit: (unit: UnitBox) => void;
   onInspectPort: (port: PortWithStatus) => void;
+  onOpenDevice: (identity: string) => void;
   selectedRadio: RadioLive | null;
   roofSwitches: BuildingHealth["devices"];
   accessSwitches: BuildingHealth["devices"];
   coreDevices: BuildingHealth["devices"];
 }) {
   const [hoveredSwitchId, setHoveredSwitchId] = useState<string | null>(null);
+  const [selectedSwitchId, setSelectedSwitchId] = useState<string | null>(null);
   const grouped = new Map<number, UnitBox[]>();
   for (const unit of units) {
     const row = grouped.get(unit.floor) ?? [];
@@ -1632,7 +1855,28 @@ function WireframeTwinView({
     }
     return byIdentity;
   }, [building.buildingModel?.switches, switchPlacements]);
-  const hoveredSwitch = hoveredSwitchId ? switchDetailsByIdentity.get(hoveredSwitchId) ?? null : null;
+  const switchChain = useMemo(
+    () => buildLocalSwitchChain(building, [...coreDevices, ...roofSwitches, ...accessSwitches]),
+    [accessSwitches, building, coreDevices, roofSwitches],
+  );
+  const internalSwitchLinks = useMemo(() => {
+    const localIds = new Set([
+      ...roofSwitches.map((device) => device.identity),
+      ...accessSwitches.map((device) => device.identity),
+      ...coreDevices.filter((device) => device.identity.includes(".R01")).map((device) => device.identity),
+    ]);
+    const seen = new Set<string>();
+    return (building.buildingModel?.direct_neighbor_edges ?? [])
+      .filter((edge) => localIds.has(edge.from_identity) && localIds.has(edge.to_identity))
+      .map((edge) => {
+        const pair = [edge.from_identity, edge.to_identity].sort().join("::");
+        if (seen.has(pair)) return null;
+        seen.add(pair);
+        return { from: edge.from_identity, to: edge.to_identity };
+      })
+      .filter(isPresent);
+  }, [accessSwitches, building.buildingModel?.direct_neighbor_edges, coreDevices, roofSwitches]);
+  const hoveredSwitch = (selectedSwitchId ?? hoveredSwitchId) ? switchDetailsByIdentity.get(selectedSwitchId ?? hoveredSwitchId ?? "") ?? null : null;
   const hasMappedUnits = units.some((unit) => unit.port);
   const genericCellWidth = 32;
   const genericCellHeight = 42;
@@ -1654,6 +1898,31 @@ function WireframeTwinView({
   const genericSwitchRailX = genericFacadeRight + 34;
   const genericSwitchLabelX = genericSwitchRailX + 22;
   const genericFloorLabelX = genericFacadeLeft - 28;
+  const genericRoofSwitchCenterX = genericFacadeLeft + (genericFacadeRight - genericFacadeLeft) / 2;
+  const genericRoofSwitchCenterY = genericRoofFrontY - genericDepthY - 23;
+  const genericSwitchCenters = new Map<string, { x: number; y: number }>();
+  if (roofSwitches[0] || router) {
+    genericSwitchCenters.set((isTower && router ? router.identity : roofSwitches[0]?.identity) ?? roofLabel, {
+      x: genericRoofSwitchCenterX,
+      y: genericRoofSwitchCenterY,
+    });
+  }
+  floors.forEach((floor, floorIndex) => {
+    const rowTop = genericFacadeTop + 20 + floorIndex * (genericCellHeight + genericCellGapY);
+    const floorSwitches = switchesByFloor.get(floor) ?? [];
+    floorSwitches.forEach((placement, index) => {
+      genericSwitchCenters.set(placement.device.identity, {
+        x: genericSwitchLabelX + index * 78 + 32,
+        y: rowTop + genericCellHeight / 2,
+      });
+    });
+  });
+
+  useEffect(() => {
+    if (!selectedSwitchId) return;
+    if (switchDetailsByIdentity.has(selectedSwitchId)) return;
+    setSelectedSwitchId(null);
+  }, [selectedSwitchId, switchDetailsByIdentity]);
 
   return (
     <div style={{ display: "grid", gridTemplateColumns: isTower ? "1.45fr 0.75fr" : "1.2fr 0.8fr", gap: 16 }}>
@@ -1664,6 +1933,46 @@ function WireframeTwinView({
             {building.knownUnits.length ? "Verified unit labels" : "Port-derived unit proxy layout"}
           </div>
         </div>
+
+        {switchChain.length > 1 ? (
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 8,
+              flexWrap: "wrap",
+              marginBottom: 12,
+              padding: "10px 12px",
+              borderRadius: 10,
+              border: "1px solid #1e293b",
+              background: "#030712",
+            }}
+          >
+            <div style={{ fontSize: 10, letterSpacing: "0.08em", color: "#475569", marginRight: 6 }}>SWITCH CHAIN</div>
+            {switchChain.map((identity, index) => (
+              <Fragment key={identity}>
+                <div
+                  onMouseEnter={() => setHoveredSwitchId(identity)}
+                  onMouseLeave={() => setHoveredSwitchId((current) => (current === identity ? null : current))}
+                  onClick={() => setSelectedSwitchId((current) => (current === identity ? null : identity))}
+                  style={{
+                    padding: "6px 10px",
+                    borderRadius: 999,
+                    border: `1px solid ${selectedSwitchId === identity ? "#38bdf8" : "#22c55e"}`,
+                    background: selectedSwitchId === identity ? "#082f49" : "#052e16",
+                    color: "#dcfce7",
+                    fontSize: 10,
+                    fontWeight: 800,
+                    cursor: "pointer",
+                  }}
+                >
+                  {humanizeIdentity(identity)}
+                </div>
+                {index < switchChain.length - 1 ? <div style={{ color: "#22c55e", fontSize: 12, fontWeight: 800 }}>→</div> : null}
+              </Fragment>
+            ))}
+          </div>
+        ) : null}
 
         <div style={{ display: "flex", justifyContent: "center" }}>
           <div style={{ position: "relative", width: Math.max(isTower ? 620 : 520, maxCols * (isTower ? 34 : 42) + 210), paddingTop: isTower ? 76 : 64, paddingRight: isTower ? 18 : 14 }}>
@@ -1741,6 +2050,24 @@ function WireframeTwinView({
                 <div style={{ fontSize: 10, color: "#94a3b8", marginTop: 3 }}>
                   {hoveredSwitch.model ?? "Switch"}{hoveredSwitch.ip ? ` · ${hoveredSwitch.ip}` : ""}{hoveredSwitch.version ? ` · ${hoveredSwitch.version}` : ""}
                 </div>
+                {selectedSwitchId ? (
+                  <button
+                    onClick={() => setSelectedSwitchId(null)}
+                    style={{
+                      marginTop: 10,
+                      borderRadius: 8,
+                      border: "1px solid #164e63",
+                      background: "#082f49",
+                      color: "#bae6fd",
+                      padding: "6px 10px",
+                      cursor: "pointer",
+                      fontSize: 10,
+                      fontWeight: 700,
+                    }}
+                  >
+                    Close switch detail
+                  </button>
+                ) : null}
                 <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginTop: 10 }}>
                   <div>
                     <div style={{ fontSize: 9, color: "#475569" }}>Placement</div>
@@ -1847,16 +2174,18 @@ function WireframeTwinView({
                                     title={`${placement.device.identity} · ${placement.count} units`}
                                     onMouseEnter={() => setHoveredSwitchId(placement.device.identity)}
                                     onMouseLeave={() => setHoveredSwitchId((current) => (current === placement.device.identity ? null : current))}
+                                    onClick={() => setSelectedSwitchId((current) => (current === placement.device.identity ? null : placement.device.identity))}
                                     style={{
                                       minWidth: 52,
                                       padding: "5px 8px",
                                       borderRadius: 8,
-                                      border: "1px solid #22c55e",
-                                      background: "#052e16",
+                                      border: `1px solid ${selectedSwitchId === placement.device.identity ? "#38bdf8" : "#22c55e"}`,
+                                      background: selectedSwitchId === placement.device.identity ? "#082f49" : "#052e16",
                                       color: "#dcfce7",
                                       fontSize: 9,
                                       fontWeight: 800,
                                       textAlign: "center",
+                                      cursor: "pointer",
                                     }}
                                   >
                                     {placement.label}
@@ -1892,7 +2221,17 @@ function WireframeTwinView({
                           key={placement.device.identity}
                           onMouseEnter={() => setHoveredSwitchId(placement.device.identity)}
                           onMouseLeave={() => setHoveredSwitchId((current) => (current === placement.device.identity ? null : current))}
-                          style={{ padding: "5px 10px", borderRadius: 8, border: "1px solid #22c55e", background: "#052e16", color: "#dcfce7", fontSize: 9, fontWeight: 800 }}
+                          onClick={() => setSelectedSwitchId((current) => (current === placement.device.identity ? null : placement.device.identity))}
+                          style={{
+                            padding: "5px 10px",
+                            borderRadius: 8,
+                            border: `1px solid ${selectedSwitchId === placement.device.identity ? "#38bdf8" : "#22c55e"}`,
+                            background: selectedSwitchId === placement.device.identity ? "#082f49" : "#052e16",
+                            color: "#dcfce7",
+                            fontSize: 9,
+                            fontWeight: 800,
+                            cursor: "pointer",
+                          }}
                         >
                           {placement.label}
                         </div>
@@ -2009,6 +2348,29 @@ function WireframeTwinView({
                   {/* Switch rail */}
                   <line x1={genericSwitchRailX} y1={genericFacadeTop + 24} x2={genericSwitchRailX} y2={genericFacadeBottom - 22} stroke="rgba(56,189,248,0.75)" strokeWidth="3" />
 
+                  {/* Internal switch backbone / daisy chains */}
+                  {internalSwitchLinks.map((link) => {
+                    const from = genericSwitchCenters.get(link.from);
+                    const to = genericSwitchCenters.get(link.to);
+                    if (!from || !to) return null;
+                    return (
+                      <g key={`${link.from}-${link.to}`}>
+                        <line
+                          x1={from.x}
+                          y1={from.y}
+                          x2={to.x}
+                          y2={to.y}
+                          stroke="#22c55e"
+                          strokeWidth="3"
+                          strokeLinecap="round"
+                          opacity="0.9"
+                        />
+                        <circle cx={from.x} cy={from.y} r="2.5" fill="#22c55e" />
+                        <circle cx={to.x} cy={to.y} r="2.5" fill="#22c55e" />
+                      </g>
+                    );
+                  })}
+
                   {/* Floor rows */}
                   {floors.map((floor, floorIndex) => {
                     const row = grouped.get(floor) ?? [];
@@ -2026,9 +2388,10 @@ function WireframeTwinView({
                           if (!unit) return null;
                           const x = genericFacadeLeft + 18 + colIndex * (genericCellWidth + genericCellGapX);
                           const y = rowTop;
-                          const frontFill = `${STATUS_COLOR[unit.status]}cc`;
-                          const topFill = `${STATUS_COLOR[unit.status]}88`;
-                          const sideFill = `${STATUS_COLOR[unit.status]}66`;
+                          const unitColor = unitFaceColor(unit);
+                          const frontFill = `${unitColor}cc`;
+                          const topFill = `${unitColor}88`;
+                          const sideFill = `${unitColor}66`;
                           const edge = selectedUnit?.unit === unit.unit ? "#f8fafc" : "rgba(148,163,184,0.88)";
                           return (
                             <g
@@ -2060,9 +2423,10 @@ function WireframeTwinView({
                             transform={`translate(${genericSwitchLabelX + index * 78}, ${rowTop + genericCellHeight / 2 - 12})`}
                             onMouseEnter={() => setHoveredSwitchId(placement.device.identity)}
                             onMouseLeave={() => setHoveredSwitchId((cur) => cur === placement.device.identity ? null : cur)}
+                            onClick={() => setSelectedSwitchId((current) => (current === placement.device.identity ? null : placement.device.identity))}
                             style={{ cursor: "default" }}
                           >
-                            <rect x="0" y="0" width="64" height="24" rx="6" fill="#052e16" stroke="#22c55e" />
+                            <rect x="0" y="0" width="64" height="24" rx="6" fill={selectedSwitchId === placement.device.identity ? "#082f49" : "#052e16"} stroke={selectedSwitchId === placement.device.identity ? "#38bdf8" : "#22c55e"} />
                             <text x="32" y="16" fill="#dcfce7" fontSize="10" fontWeight="800" textAnchor="middle">{placement.label}</text>
                           </g>
                         ))}
@@ -2090,13 +2454,14 @@ function WireframeTwinView({
                 {selectedRadio ? (
                   <div style={{
                     position: "absolute",
-                    right: 0,
-                    top: genericFacadeTop,
-                    width: 176,
+                    left: genericFacadeLeft + 20,
+                    top: 10,
+                    width: Math.min(220, genericFacadeRight - genericFacadeLeft - 40),
                     background: "rgba(2,6,23,0.92)",
                     border: "1px solid rgba(56,189,248,0.35)",
                     borderRadius: 8,
                     padding: "10px 12px",
+                    boxShadow: "0 10px 24px rgba(2,6,23,0.32)",
                   }}>
                     <div style={{ fontSize: 9, letterSpacing: "0.14em", color: "#38bdf8", marginBottom: 10, fontWeight: 700 }}>RF LINKS ACTIVE</div>
                     {[
@@ -2105,9 +2470,9 @@ function WireframeTwinView({
                       <div key={link.name} style={{ marginBottom: 10 }}>
                         <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 2 }}>
                           <div style={{ width: 7, height: 7, borderRadius: 2, background: STATUS_COLOR[link.status], flexShrink: 0 }} />
-                          <div style={{ fontSize: 10, color: "#e2e8f0", fontWeight: 700, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{link.name}</div>
+                          <div style={{ fontSize: 10, color: "#e2e8f0", fontWeight: 700, lineHeight: 1.35, whiteSpace: "normal", wordBreak: "break-word" }}>{link.name}</div>
                         </div>
-                        <div style={{ fontSize: 9, color: "#475569", paddingLeft: 13 }}>{link.freq} · {link.model} · {link.status}</div>
+                        <div style={{ fontSize: 9, color: "#475569", paddingLeft: 13, lineHeight: 1.35 }}>{link.freq} · {link.model} · {link.status}</div>
                       </div>
                     ))}
                   </div>
@@ -2139,14 +2504,25 @@ function WireframeTwinView({
           {selectedUnit ? (
             <>
               <div style={{ fontSize: 18, fontWeight: 700, color: "#f8fafc" }}>{selectedUnit.unit}</div>
-              <div style={{ fontSize: 11, color: STATUS_COLOR[selectedUnit.status], marginTop: 4 }}>{humanStatus(selectedUnit.status)}</div>
+              <div style={{ fontSize: 11, color: unitFaceColor(selectedUnit), marginTop: 4 }}>{unitStatusLabel(selectedUnit)}</div>
               <div style={{ display: "grid", gap: 8, marginTop: 14 }}>
                 {[
                   { label: "CPE MAC", value: selectedUnit.port?.mac ?? "Unknown" },
-                  { label: "Switch", value: selectedUnit.port?.identity ?? "Unknown" },
+                  {
+                    label: "Switch",
+                    value: selectedUnit.port?.identity ? (
+                      <button
+                        onClick={() => onOpenDevice(selectedUnit.port!.identity)}
+                        style={{ background: "none", border: "none", padding: 0, color: "#93c5fd", cursor: "pointer", font: "inherit", textDecoration: "underline" }}
+                      >
+                        {selectedUnit.port.identity}
+                      </button>
+                    ) : "Unknown",
+                  },
                   { label: "Port", value: ifaceLabel(selectedUnit.port?.on_interface) },
                   { label: "VLAN", value: selectedUnit.port ? String(selectedUnit.port.vid) : "Unknown" },
                   { label: "Vendor", value: selectedUnit.port ? vendorFromMac(selectedUnit.port.mac) : "Unknown" },
+                  { label: "Evidence", value: selectedUnit.port ? "Port-verified live client" : selectedUnit.inferred ? "Inventory/evidence-backed; no exact live port match" : "Unknown" },
                 ].map((item) => (
                   <div key={item.label} style={{ borderRadius: 8, border: "1px solid #1e293b", background: "#020617", padding: "8px 10px" }}>
                     <div style={{ fontSize: 9, color: "#475569" }}>{item.label}</div>
@@ -2194,13 +2570,23 @@ function WireframeTwinView({
             {router ? (
               <div style={{ padding: "8px 10px", borderRadius: 8, border: "1px solid #78350f", background: "#1c1917" }}>
                 <div style={{ fontSize: 11, color: "#fde68a", fontWeight: 700 }}>{isTower ? "Roof Router" : "Core Router"}</div>
-                <div style={{ fontSize: 11, color: "#e2e8f0", marginTop: 3 }}>{router.identity}</div>
+                <button
+                  onClick={() => onOpenDevice(router.identity)}
+                  style={{ background: "none", border: "none", padding: 0, color: "#93c5fd", cursor: "pointer", fontSize: 11, marginTop: 3, textDecoration: "underline", textAlign: "left" }}
+                >
+                  {router.identity}
+                </button>
               </div>
             ) : null}
             {switchPlacements.map((placement) => (
               <div key={placement.device.identity} style={{ padding: "8px 10px", borderRadius: 8, border: "1px solid #0f172a", background: "#020617" }}>
                 <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
-                  <span style={{ fontSize: 11, color: "#e2e8f0", fontWeight: 700 }}>{placement.device.identity}</span>
+                  <button
+                    onClick={() => onOpenDevice(placement.device.identity)}
+                    style={{ background: "none", border: "none", padding: 0, color: "#93c5fd", cursor: "pointer", fontSize: 11, fontWeight: 700, textDecoration: "underline", textAlign: "left" }}
+                  >
+                    {placement.device.identity}
+                  </button>
                   <span style={{ fontSize: 10, color: "#94a3b8" }}>{placement.floor === 0 ? "Basement" : `Floor ${String(placement.floor).padStart(2, "0")}`}</span>
                 </div>
                 <div style={{ fontSize: 10, color: "#64748b", marginTop: 4 }}>{placement.count} mapped units · inferred from port-to-unit mapping</div>
@@ -2239,7 +2625,6 @@ function MapView({
   const mapReadyRef = useRef(false);
   const buildingsRef = useRef(buildings);
   const radiosRef = useRef(radios);
-  const [overlayVersion, setOverlayVersion] = useState(0);
 
   useEffect(() => {
     buildingsRef.current = buildings;
@@ -2276,7 +2661,7 @@ function MapView({
     () =>
       radios
         .map((radio) => {
-          const coord = getCoord(radio.address, siteTopology, radio.anchorBuildingId);
+          const coord = radioCoord(radio, siteTopology);
           if (!coord) return null;
           return {
             type: "Feature" as const,
@@ -2307,42 +2692,18 @@ function MapView({
       geometry: { type: "LineString"; coordinates: number[][] };
     }> = [];
 
-    for (const radio of radios) {
-      const anchor = byBuildingId.get(radio.anchorBuildingId);
-      const radioCoord = getCoord(radio.address, siteTopology, radio.anchorBuildingId);
-      const anchorCoord = anchor ? getCoord(anchor.address, siteTopology, anchor.id) : null;
-      if (!radioCoord || !anchorCoord) continue;
-      if (distanceBetweenCoords(radioCoord, anchorCoord) > 0.0012) continue;
-      features.push({
-        type: "Feature",
-        properties: {
-          kind: "anchor",
-          strength: radio.status === "offline" ? "weak" : "medium",
-          label: radio.model,
-          status: degradeStatus(anchor?.status ?? "unknown", radio.status),
-        },
-        geometry: {
-          type: "LineString",
-          coordinates: [
-            [anchorCoord.lon, anchorCoord.lat],
-            [radioCoord.lon, radioCoord.lat],
-          ],
-        },
-      });
-    }
-
     for (const link of radioLinks) {
       const fromBuilding = link.fromBuildingId ? byBuildingId.get(link.fromBuildingId) : null;
       const toBuilding = link.toBuildingId ? byBuildingId.get(link.toBuildingId) : null;
       const fromRadio = link.fromRadioId ? byRadioId.get(link.fromRadioId) : null;
       const toRadio = link.toRadioId ? byRadioId.get(link.toRadioId) : null;
-      const preferRadioEndpoints = link.kind !== "Siklu transport";
+      const preferRadioEndpoints = link.kind !== "Siklu transport" && !(fromBuilding && toBuilding);
       const fromCoord = preferRadioEndpoints
-        ? fromRadio ? getCoord(fromRadio.address, siteTopology, fromRadio.anchorBuildingId) : fromBuilding ? getCoord(fromBuilding.address, siteTopology, canonicalBuildingIdOf(fromBuilding)) : null
-        : fromBuilding ? getCoord(fromBuilding.address, siteTopology, canonicalBuildingIdOf(fromBuilding)) : fromRadio ? getCoord(fromRadio.address, siteTopology, fromRadio.anchorBuildingId) : null;
+        ? fromRadio ? radioCoord(fromRadio, siteTopology) : fromBuilding ? getCoord(fromBuilding.address, siteTopology, canonicalBuildingIdOf(fromBuilding)) : null
+        : fromBuilding ? getCoord(fromBuilding.address, siteTopology, canonicalBuildingIdOf(fromBuilding)) : fromRadio ? radioCoord(fromRadio, siteTopology) : null;
       const toCoord = preferRadioEndpoints
-        ? toRadio ? getCoord(toRadio.address, siteTopology, toRadio.anchorBuildingId) : toBuilding ? getCoord(toBuilding.address, siteTopology, canonicalBuildingIdOf(toBuilding)) : null
-        : toBuilding ? getCoord(toBuilding.address, siteTopology, canonicalBuildingIdOf(toBuilding)) : toRadio ? getCoord(toRadio.address, siteTopology, toRadio.anchorBuildingId) : null;
+        ? toRadio ? radioCoord(toRadio, siteTopology) : toBuilding ? getCoord(toBuilding.address, siteTopology, canonicalBuildingIdOf(toBuilding)) : null
+        : toBuilding ? getCoord(toBuilding.address, siteTopology, canonicalBuildingIdOf(toBuilding)) : toRadio ? radioCoord(toRadio, siteTopology) : null;
       const fromStatus = preferRadioEndpoints ? fromRadio?.status ?? fromBuilding?.status : fromBuilding?.status ?? fromRadio?.status;
       const toStatus = preferRadioEndpoints ? toRadio?.status ?? toBuilding?.status : toBuilding?.status ?? toRadio?.status;
       if (!fromCoord || !toCoord || !fromStatus || !toStatus) continue;
@@ -2371,31 +2732,43 @@ function MapView({
   const cambiumLineFeatures = useMemo(() => {
     const byBuildingId = new Map(buildings.map((building) => [canonicalBuildingIdOf(building), building]));
     const byRadioId = new Map(radios.map((radio) => [radio.id, radio]));
-    const findBuildingEndpoint = (label?: string | null, buildingId?: string | null, location?: string | null) => {
-      const candidates = buildingId
-        ? buildings.filter((building) => canonicalBuildingIdOf(building) === buildingId)
-        : buildings;
-      return candidates.find((building) => buildingMatchesEndpoint(building, label, location)) ?? candidates[0] ?? null;
-    };
+    const sikluBuildingPairs = new Set(
+      (siteTopology?.radio_links ?? [])
+        .filter((link) => (link.kind ?? "").toLowerCase() === "siklu" && link.from_building_id && link.to_building_id)
+        .map((link) =>
+          [String(link.from_building_id), String(link.to_building_id)].sort().join("::"),
+        ),
+    );
     return (siteTopology?.radio_links ?? [])
       .filter((link) => (link.kind ?? "").toLowerCase() === "cambium")
+      .filter((link) => Boolean(link.from_building_id && link.to_building_id))
+      .filter((link) => {
+        const fromBuildingId = link.from_building_id ? String(link.from_building_id) : "";
+        const toBuildingId = link.to_building_id ? String(link.to_building_id) : "";
+        return !sikluBuildingPairs.has([fromBuildingId, toBuildingId].sort().join("::"));
+      })
       .map((link) => {
         const fromBuilding =
           (link.from_building_id ? byBuildingId.get(link.from_building_id) : null) ??
-          findBuildingEndpoint(link.from_label, link.from_building_id, link.location);
+          findMatchingBuilding(buildings, link.from_label, link.from_building_id, link.location);
         const toBuilding =
           (link.to_building_id ? byBuildingId.get(link.to_building_id) : null) ??
-          findBuildingEndpoint(link.to_label, link.to_building_id, null);
+          findMatchingBuilding(buildings, link.to_label, link.to_building_id, null);
         const fromRadio = link.from_radio_id
           ? byRadioId.get(link.from_radio_id)
           : radios.find((radio) => radioMatchesEndpoint(radio, link.from_label, link.location));
         const toRadio = link.to_radio_id
           ? byRadioId.get(link.to_radio_id)
           : radios.find((radio) => radioMatchesEndpoint(radio, link.to_label, null));
-        const fromCoord = fromRadio ? getCoord(fromRadio.address, siteTopology, fromRadio.anchorBuildingId) : fromBuilding ? getCoord(fromBuilding.address, siteTopology, canonicalBuildingIdOf(fromBuilding)) : null;
-        const toCoord = toRadio ? getCoord(toRadio.address, siteTopology, toRadio.anchorBuildingId) : toBuilding ? getCoord(toBuilding.address, siteTopology, canonicalBuildingIdOf(toBuilding)) : null;
-        const fromStatus = fromRadio?.status ?? fromBuilding?.status;
-        const toStatus = toRadio?.status ?? toBuilding?.status;
+        const preferRadioEndpoints = !(fromBuilding && toBuilding);
+        const fromCoord = preferRadioEndpoints
+          ? fromRadio ? radioCoord(fromRadio, siteTopology) : fromBuilding ? getCoord(fromBuilding.address, siteTopology, canonicalBuildingIdOf(fromBuilding)) : null
+          : fromBuilding ? getCoord(fromBuilding.address, siteTopology, canonicalBuildingIdOf(fromBuilding)) : fromRadio ? radioCoord(fromRadio, siteTopology) : null;
+        const toCoord = preferRadioEndpoints
+          ? toRadio ? radioCoord(toRadio, siteTopology) : toBuilding ? getCoord(toBuilding.address, siteTopology, canonicalBuildingIdOf(toBuilding)) : null
+          : toBuilding ? getCoord(toBuilding.address, siteTopology, canonicalBuildingIdOf(toBuilding)) : toRadio ? radioCoord(toRadio, siteTopology) : null;
+        const fromStatus = preferRadioEndpoints ? fromRadio?.status ?? fromBuilding?.status : fromBuilding?.status ?? fromRadio?.status;
+        const toStatus = preferRadioEndpoints ? toRadio?.status ?? toBuilding?.status : toBuilding?.status ?? toRadio?.status;
         if (!fromCoord || !toCoord || !fromStatus || !toStatus) return null;
         return {
           type: "Feature" as const,
@@ -2408,7 +2781,10 @@ function MapView({
           },
           geometry: {
             type: "LineString" as const,
-            coordinates: arcLineCoordinates([fromCoord.lon, fromCoord.lat], [toCoord.lon, toCoord.lat]),
+            coordinates: [
+              [fromCoord.lon, fromCoord.lat],
+              [toCoord.lon, toCoord.lat],
+            ],
           },
         };
       })
@@ -2445,29 +2821,6 @@ function MapView({
       },
     }));
   }, [cambiumLineFeatures]);
-
-  const cambiumOverlayPaths = useMemo(() => {
-    const map = mapRef.current;
-    const frame = frameRef.current;
-    if (!map || !frame || !mapReadyRef.current) return [];
-    return cambiumLineFeatures
-      .map((feature, index) => {
-        const points = feature.geometry.coordinates
-          .map((coord) => map.project(coord as [number, number]))
-          .map((point) => [point.x, point.y] as const);
-        if (points.length < 2) return null;
-        const [start, ...rest] = points;
-        const d = `M ${start[0].toFixed(1)} ${start[1].toFixed(1)} ${rest.map((point) => `L ${point[0].toFixed(1)} ${point[1].toFixed(1)}`).join(" ")}`;
-        const midpoint = points[Math.floor(points.length / 2)];
-        return {
-          id: `${feature.properties.label}-${index}`,
-          d,
-          x: midpoint[0],
-          y: midpoint[1],
-        };
-      })
-      .filter(isPresent) as Array<{ id: string; d: string; x: number; y: number }>;
-  }, [cambiumLineFeatures, overlayVersion]);
 
   const syncMapData = (
     map: maplibregl.Map,
@@ -2559,11 +2912,8 @@ function MapView({
     mapRef.current = map;
     map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "top-right");
 
-    const syncOverlay = () => setOverlayVersion((value) => value + 1);
-
     map.on("load", () => {
       mapReadyRef.current = true;
-      syncOverlay();
       map.addSource("building-nodes", {
         type: "geojson",
         data: { type: "FeatureCollection", features: [] },
@@ -2844,15 +3194,8 @@ function MapView({
       syncMapData(map, buildingFeatures, radioFeatures, lineFeatures, cambiumLineFeatures, packetFeatures, cambiumPacketFeatures, selectedId, selectedRadioId);
     });
 
-    map.on("move", syncOverlay);
-    map.on("zoom", syncOverlay);
-    map.on("resize", syncOverlay);
-
     return () => {
       mapReadyRef.current = false;
-      map.off("move", syncOverlay);
-      map.off("zoom", syncOverlay);
-      map.off("resize", syncOverlay);
       map.remove();
       mapRef.current = null;
     };
@@ -2862,7 +3205,6 @@ function MapView({
     const map = mapRef.current;
     if (!map || !mapReadyRef.current) return;
     syncMapData(map, buildingFeatures, radioFeatures, lineFeatures, cambiumLineFeatures, packetFeatures, cambiumPacketFeatures, selectedId, selectedRadioId);
-    setOverlayVersion((value) => value + 1);
   }, [buildingFeatures, cambiumLineFeatures, cambiumPacketFeatures, lineFeatures, packetFeatures, radioFeatures, selectedId, selectedRadioId]);
 
   useEffect(() => {
@@ -2882,15 +3224,6 @@ function MapView({
   return (
     <div ref={frameRef} style={{ position: "relative", height: 680, width: "100%", borderRadius: 18, overflow: "hidden", border: "1px solid rgba(125,211,252,0.2)" }}>
       <div ref={containerRef} style={{ position: "absolute", inset: 0 }} />
-      <svg style={{ position: "absolute", inset: 0, width: "100%", height: "100%", pointerEvents: "none", zIndex: 6 }}>
-        {cambiumOverlayPaths.map((path) => (
-          <g key={path.id}>
-            <path d={path.d} fill="none" stroke="rgba(56,189,248,0.24)" strokeWidth={12} strokeLinecap="round" strokeLinejoin="round" />
-            <path d={path.d} fill="none" stroke="#67e8f9" strokeWidth={5} strokeDasharray="12 9" strokeLinecap="round" strokeLinejoin="round" />
-            <circle cx={path.x} cy={path.y} r={5} fill="#67e8f9" stroke="#082f49" strokeWidth={1.5} />
-          </g>
-        ))}
-      </svg>
     </div>
   );
 }
@@ -2926,6 +3259,7 @@ function BuildingView({
   const summaryPortValue = loadingModel ? "..." : building.customerCount > 0 ? String(building.customerCount) : evidenceOnlineCount > 0 ? String(evidenceOnlineCount) : "0";
   const [selectedUnitId, setSelectedUnitId] = useState<string | null>(null);
   const [summaryFocus, setSummaryFocus] = useState<SummaryFocus>(null);
+  const [selectedDeviceIdentity, setSelectedDeviceIdentity] = useState<string | null>(null);
   const selectedUnit = unitBoxes.find((unit) => unit.unit === selectedUnitId) ?? unitBoxes[0] ?? null;
   const portsByIssueKey = useMemo(() => new Map(ports.map((port) => [portKey(port.identity, port.on_interface), port])), [ports]);
   const sortedFlapPorts = useMemo(
@@ -2938,6 +3272,52 @@ function BuildingView({
     ),
     [building.buildingModel?.exact_unit_port_matches],
   );
+  const deviceDetailMap = useMemo(() => {
+    const modeledSwitches = new Map((building.buildingModel?.switches ?? []).map((entry) => [entry.identity, entry]));
+    const neighborEdges = building.buildingModel?.direct_neighbor_edges ?? [];
+    const byIdentity = new Map<string, {
+      identity: string;
+      ip?: string;
+      model?: string;
+      version?: string;
+      servedUnits: string[];
+      servedFloors: number[];
+      neighborCount: number;
+      kind: string;
+    }>();
+    for (const device of devices) {
+      const modeled = modeledSwitches.get(device.identity);
+      byIdentity.set(device.identity, {
+        identity: device.identity,
+        ip: device.ip,
+        model: device.model || modeled?.model,
+        version: device.version || modeled?.version,
+        servedUnits: modeled?.served_units ?? [],
+        servedFloors: modeled?.served_floors ?? [],
+        neighborCount: neighborEdges.filter((edge) => edge.from_identity === device.identity || edge.to_identity === device.identity).length,
+        kind: deviceKind(device.identity),
+      });
+    }
+    for (const modeled of building.buildingModel?.switches ?? []) {
+      if (byIdentity.has(modeled.identity)) continue;
+      byIdentity.set(modeled.identity, {
+        identity: modeled.identity,
+        ip: modeled.ip,
+        model: modeled.model,
+        version: modeled.version,
+        servedUnits: modeled.served_units ?? [],
+        servedFloors: modeled.served_floors ?? [],
+        neighborCount: neighborEdges.filter((edge) => edge.from_identity === modeled.identity || edge.to_identity === modeled.identity).length,
+        kind: deviceKind(modeled.identity),
+      });
+    }
+    return byIdentity;
+  }, [building.buildingModel?.direct_neighbor_edges, building.buildingModel?.switches, devices]);
+  const selectedDevice = selectedDeviceIdentity ? deviceDetailMap.get(selectedDeviceIdentity) ?? null : null;
+  const openDeviceDetails = (identity: string) => {
+    setSelectedDeviceIdentity(identity);
+    setSummaryFocus("devices");
+  };
 
   useEffect(() => {
     setSelectedUnitId(unitBoxes[0]?.unit ?? null);
@@ -2945,6 +3325,10 @@ function BuildingView({
 
   useEffect(() => {
     setSummaryFocus(null);
+  }, [building.id]);
+
+  useEffect(() => {
+    setSelectedDeviceIdentity(null);
   }, [building.id]);
 
   return (
@@ -2992,6 +3376,7 @@ function BuildingView({
         selectedUnit={selectedUnit}
         onSelectUnit={(unit) => setSelectedUnitId(unit.unit)}
         onInspectPort={onSelectPort}
+        onOpenDevice={openDeviceDetails}
         selectedRadio={selectedRadio}
         roofSwitches={roofSwitches}
         accessSwitches={accessSwitches}
@@ -3027,13 +3412,51 @@ function BuildingView({
 
       <TopologyBranchPanel building={building} devices={devices} selectedRadio={selectedRadio} />
 
+      {selectedDevice ? (
+        <div style={{ background: "#020617", border: "1px solid #1e293b", borderRadius: 10, padding: 14, marginBottom: 16 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "start" }}>
+            <div>
+              <div style={{ fontSize: 10, letterSpacing: "0.1em", color: "#475569", marginBottom: 10 }}>SELECTED DEVICE</div>
+              <div style={{ fontSize: 18, color: "#e2e8f0", fontWeight: 700 }}>{selectedDevice.identity}</div>
+              <div style={{ fontSize: 11, color: "#94a3b8", marginTop: 4 }}>
+                {selectedDevice.model ?? "Unknown model"}{selectedDevice.ip ? ` · ${selectedDevice.ip}` : ""}{selectedDevice.version ? ` · ${selectedDevice.version}` : ""}
+              </div>
+            </div>
+            <button
+              onClick={() => setSelectedDeviceIdentity(null)}
+              style={{ border: "1px solid #164e63", background: "#082f49", color: "#bae6fd", borderRadius: 8, padding: "8px 10px", cursor: "pointer", fontSize: 11, fontWeight: 700 }}
+            >
+              Close device detail
+            </button>
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: 8, marginTop: 12 }}>
+            {[
+              { label: "Role", value: selectedDevice.kind },
+              { label: "Neighbors", value: String(selectedDevice.neighborCount) },
+              { label: "Served floors", value: selectedDevice.servedFloors.length ? selectedDevice.servedFloors.map((floor) => String(floor).padStart(2, "0")).join(", ") : "n/a" },
+              { label: "Served units", value: selectedDevice.servedUnits.length ? String(selectedDevice.servedUnits.length) : "0" },
+            ].map((item) => (
+              <div key={item.label} style={{ borderRadius: 8, border: "1px solid #1e293b", background: "#020617", padding: "8px 10px" }}>
+                <div style={{ fontSize: 9, color: "#475569" }}>{item.label}</div>
+                <div style={{ fontSize: 12, color: "#e2e8f0", fontWeight: 600, marginTop: 2 }}>{item.value}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      ) : null}
+
       <div style={{ display: "grid", gridTemplateColumns: "1.15fr 0.85fr", gap: 14, marginBottom: 16 }}>
         <div style={{ background: "#020617", border: "1px solid #1e293b", borderRadius: 10, padding: 14 }}>
           <div style={{ fontSize: 10, letterSpacing: "0.1em", color: "#475569", marginBottom: 12 }}>LIVE DEVICES</div>
           <div style={{ display: "grid", gap: 8 }}>
             {devices.map((device) => (
               <div key={device.identity} style={{ border: "1px solid #1e293b", borderRadius: 8, padding: "10px 12px", background: "#030712" }}>
-                <div style={{ fontSize: 12, color: "#e2e8f0", fontWeight: 600 }}>{device.identity}</div>
+                <button
+                  onClick={() => openDeviceDetails(device.identity)}
+                  style={{ background: "none", border: "none", padding: 0, color: "#93c5fd", cursor: "pointer", fontSize: 12, fontWeight: 600, textDecoration: "underline", textAlign: "left" }}
+                >
+                  {device.identity}
+                </button>
                 <div style={{ fontSize: 10, color: "#64748b", marginTop: 4 }}>
                   {device.model} · {device.ip} · {device.version}
                 </div>
@@ -3087,7 +3510,12 @@ function BuildingView({
             <div style={{ display: "grid", gap: 8 }}>
               {devices.map((device) => (
                 <div key={device.identity} style={{ border: "1px solid #0f172a", borderRadius: 8, padding: "10px 12px", background: "#030712" }}>
-                  <div style={{ fontSize: 12, color: "#e2e8f0", fontWeight: 700 }}>{device.identity}</div>
+                  <button
+                    onClick={() => openDeviceDetails(device.identity)}
+                    style={{ background: "none", border: "none", padding: 0, color: "#93c5fd", cursor: "pointer", fontSize: 12, fontWeight: 700, textDecoration: "underline", textAlign: "left" }}
+                  >
+                    {device.identity}
+                  </button>
                   <div style={{ fontSize: 10, color: "#94a3b8", marginTop: 4 }}>{device.model} · {device.ip} · {device.version}</div>
                 </div>
               ))}
@@ -3137,7 +3565,15 @@ function BuildingView({
                     <div key={`${issue.identity}-${issue.interface}-${index}`} style={{ border: "1px solid #0f172a", borderRadius: 8, padding: "10px 12px", background: "#030712" }}>
                       <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center" }}>
                         <div>
-                          <div style={{ fontSize: 12, color: "#e2e8f0", fontWeight: 700 }}>{issue.identity} · {ifaceLabel(issue.interface)}</div>
+                          <div style={{ fontSize: 12, color: "#e2e8f0", fontWeight: 700 }}>
+                            <button
+                              onClick={() => openDeviceDetails(issue.identity)}
+                              style={{ background: "none", border: "none", padding: 0, color: "#93c5fd", cursor: "pointer", font: "inherit", textDecoration: "underline" }}
+                            >
+                              {issue.identity}
+                            </button>{" "}
+                            · {ifaceLabel(issue.interface)}
+                          </div>
                           <div style={{ fontSize: 10, color: "#94a3b8", marginTop: 4 }}>
                             {(issue.issues ?? []).join(" · ") || issue.comment || "Flap history detected"}
                           </div>
@@ -3191,7 +3627,15 @@ function BuildingView({
                       <div style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
                         <div>
                           <div style={{ fontSize: 12, color: "#e2e8f0", fontWeight: 700 }}>{match.unit}</div>
-                          <div style={{ fontSize: 10, color: "#94a3b8", marginTop: 4 }}>{match.switch_identity} · {match.interface} · {match.mac}</div>
+                          <div style={{ fontSize: 10, color: "#94a3b8", marginTop: 4 }}>
+                            <button
+                              onClick={() => openDeviceDetails(match.switch_identity)}
+                              style={{ background: "none", border: "none", padding: 0, color: "#93c5fd", cursor: "pointer", font: "inherit", textDecoration: "underline" }}
+                            >
+                              {match.switch_identity}
+                            </button>{" "}
+                            · {match.interface} · {match.mac}
+                          </div>
                         </div>
                         {matchedPort ? (
                           <button
@@ -3238,7 +3682,12 @@ function BuildingView({
             <div style={{ display: "grid", gap: 8 }}>
               {building.buildingModel.switches.map((entry) => (
                 <div key={entry.identity} style={{ border: "1px solid #0f172a", borderRadius: 8, padding: "10px 12px", background: "#030712" }}>
-                  <div style={{ fontSize: 12, color: "#e2e8f0", fontWeight: 700 }}>{entry.identity}</div>
+                  <button
+                    onClick={() => openDeviceDetails(entry.identity)}
+                    style={{ background: "none", border: "none", padding: 0, color: "#93c5fd", cursor: "pointer", fontSize: 12, fontWeight: 700, textDecoration: "underline", textAlign: "left" }}
+                  >
+                    {entry.identity}
+                  </button>
                   <div style={{ fontSize: 10, color: "#64748b", marginTop: 4 }}>
                     Exact floors: {entry.served_floors.length ? entry.served_floors.map((floor) => String(floor).padStart(2, "0")).join(", ") : "none"} · exact units: {entry.exact_match_count}
                   </div>
@@ -3248,8 +3697,26 @@ function BuildingView({
             <div style={{ display: "grid", gap: 8 }}>
               {(building.buildingModel.direct_neighbor_edges.slice(0, 6)).map((edge, index) => (
                 <div key={`${edge.from_identity}-${edge.from_interface}-${edge.to_identity}-${index}`} style={{ border: "1px solid #0f172a", borderRadius: 8, padding: "10px 12px", background: "#030712" }}>
-                  <div style={{ fontSize: 11, color: "#e2e8f0", fontWeight: 700 }}>{edge.from_identity} · {edge.from_interface}</div>
-                  <div style={{ fontSize: 10, color: "#64748b", marginTop: 4 }}>→ {edge.to_identity}</div>
+                  <div style={{ fontSize: 11, color: "#e2e8f0", fontWeight: 700 }}>
+                    <button
+                      onClick={() => openDeviceDetails(edge.from_identity)}
+                      style={{ background: "none", border: "none", padding: 0, color: "#93c5fd", cursor: "pointer", font: "inherit", textDecoration: "underline" }}
+                    >
+                      {edge.from_identity}
+                    </button>{" "}
+                    · {edge.from_interface}
+                  </div>
+                  <div style={{ fontSize: 10, color: "#64748b", marginTop: 4 }}>
+                    →{" "}
+                    {edge.to_identity.includes(".") ? (
+                      <button
+                        onClick={() => openDeviceDetails(edge.to_identity)}
+                        style={{ background: "none", border: "none", padding: 0, color: "#93c5fd", cursor: "pointer", font: "inherit", textDecoration: "underline" }}
+                      >
+                        {edge.to_identity}
+                      </button>
+                    ) : edge.to_identity}
+                  </div>
                 </div>
               ))}
             </div>
@@ -3551,7 +4018,7 @@ export default function NychaNoc() {
       if (retryTimer !== null) window.clearTimeout(retryTimer);
       window.clearInterval(timer);
     };
-  }, [buildingLayouts]);
+  }, []);
 
   useEffect(() => {
     if (!buildingLayouts.length) return;
@@ -3754,28 +4221,40 @@ export default function NychaNoc() {
           status: radioStatusFromJake(radio.status, radio.alerts?.length ?? 0),
           alert,
           knownUnits: addressRecord?.units ?? radio.address_units ?? [],
+          latitude: radio.latitude,
+          longitude: radio.longitude,
         };
       });
     }
 
-    return [];
+    return BUILDING_LAYOUTS.map((layout) => ({
+      id: radioIdFromName(`${layout.sourceBuildingId}-fallback-radio`),
+      name: `${layout.shortLabel} fallback transport`,
+      shortLabel: `${layout.shortLabel} link`,
+      address: layout.address,
+      model: "Legacy transport",
+      role: "Fallback transport node",
+      anchorBuildingId: layout.id,
+      x: layout.x + 44,
+      y: layout.y - 48,
+      status: "unknown" as const,
+      knownUnits: [],
+      latitude: null,
+      longitude: null,
+    }));
   }, [buildingLayouts, buildings, siteTopology]);
   const selectedRadio = radios.find((radio) => radio.id === selectedRadioId) ?? null;
 
   const radioLinks = useMemo(() => {
-    const findBuildingEndpoint = (label?: string | null, buildingId?: string | null, location?: string | null) => {
-      const candidates = buildingId
-        ? buildings.filter((building) => canonicalBuildingIdOf(building) === buildingId)
-        : buildings;
-      return candidates.find((building) => buildingMatchesEndpoint(building, label, location)) ?? candidates[0] ?? null;
-    };
     const findRadioEndpoint = (label?: string | null, location?: string | null) =>
       radios.find((radio) => radioMatchesEndpoint(radio, label, location)) ?? null;
 
-    return (siteTopology?.radio_links ?? [])
+    const liveLinks = (siteTopology?.radio_links ?? [])
+      .filter((link) => (link.kind ?? "").toLowerCase() === "siklu")
+      .filter((link) => Boolean(link.from_building_id && link.to_building_id))
       .map((link) => {
-        const fromBuilding = findBuildingEndpoint(link.from_label, link.from_building_id, link.location);
-        const toBuilding = findBuildingEndpoint(link.to_label, link.to_building_id, null);
+        const fromBuilding = findMatchingBuilding(buildings, link.from_label, link.from_building_id, link.location);
+        const toBuilding = findMatchingBuilding(buildings, link.to_label, link.to_building_id, null);
         const fromRadio = link.from_radio_id
           ? radios.find((radio) => radio.id === link.from_radio_id)
           : findRadioEndpoint(link.from_label, link.location);
@@ -3794,6 +4273,28 @@ export default function NychaNoc() {
         };
       })
       .filter(Boolean) as Array<{ fromRadioId?: string; toRadioId?: string; fromBuildingId?: string; toBuildingId?: string; strength: "strong" | "medium" | "weak"; kind: string }>;
+
+    if (liveLinks.length) return liveLinks;
+
+    return LEGACY_TRANSPORT_LINKS.map((link) => {
+      const fromBuilding = buildings.find((building) => canonicalBuildingIdOf(building) === link.from);
+      const toBuilding = buildings.find((building) => canonicalBuildingIdOf(building) === link.to);
+      const fromRadio = fromBuilding
+        ? radios.find((radio) => radio.anchorBuildingId === fromBuilding.id)
+        : null;
+      const toRadio = toBuilding
+        ? radios.find((radio) => radio.anchorBuildingId === toBuilding.id)
+        : null;
+      if (!fromBuilding || !toBuilding) return null;
+      return {
+        fromRadioId: fromRadio?.id,
+        toRadioId: toRadio?.id,
+        fromBuildingId: fromBuilding.id,
+        toBuildingId: toBuilding.id,
+        strength: link.strength,
+        kind: link.kind,
+      };
+    }).filter(Boolean) as Array<{ fromRadioId?: string; toRadioId?: string; fromBuildingId?: string; toBuildingId?: string; strength: "strong" | "medium" | "weak"; kind: string }>;
   }, [buildings, radios, siteTopology]);
 
   const selectedBuildingPorts = useMemo<PortWithStatus[]>(() => {

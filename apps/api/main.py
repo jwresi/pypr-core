@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+
 from fastapi import FastAPI
 
 from apps.api.jake_router import router as jake_router
@@ -41,17 +43,21 @@ app.include_router(slack_cmd_router)
 def startup() -> None:
     init_db()
     init_incidents_table()
-    try:
-        from apps.api.jake_router import _ops
-        from packages.jake.graph.topology import rebuild_graph
 
-        result = rebuild_graph(_ops())
-        print(
-            f"[startup] graph: {result['nodes']} nodes, "
-            f"{result['edges']} edges, {result['buildings']} buildings"
-        )
-    except Exception as exc:
-        print(f"[startup] graph build failed (non-fatal): {exc}")
+    def build_graph_in_background() -> None:
+        try:
+            from apps.api.jake_router import _ops
+            from packages.jake.graph.topology import rebuild_graph
+
+            result = rebuild_graph(_ops())
+            print(
+                f"[startup] graph: {result['nodes']} nodes, "
+                f"{result['edges']} edges, {result['buildings']} buildings"
+            )
+        except Exception as exc:
+            print(f"[startup] graph build failed (non-fatal): {exc}")
+
+    threading.Thread(target=build_graph_in_background, daemon=True).start()
 
 
 # ── platform health ────────────────────────────────────────────────────────────

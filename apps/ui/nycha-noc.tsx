@@ -1,4 +1,5 @@
 import React, { Fragment, useEffect, useMemo, useRef, useState } from "react";
+import type { ReactNode } from "react";
 import maplibregl from "maplibre-gl";
 import siteCoords from "./site-coords.json";
 import buildingProfiles from "./building-profiles.json";
@@ -68,6 +69,88 @@ type BuildingCustomerCount = {
   access_port_count: number;
   vendor_summary: Record<string, number>;
   results: PortRecord[];
+};
+
+type CpeNetworkContext = {
+  network_id?: string;
+  network_name?: string;
+  network_status?: string;
+  uptime?: string;
+  vilo_online_num?: number;
+  vilo_offline_num?: number;
+  device_online_num?: number;
+  device_offline_num?: number;
+  wan_ip_address?: string;
+  public_ip_address?: string;
+  firmware_version?: string;
+  installer?: string;
+  subscriber_id?: string;
+  flags?: string[];
+};
+
+type BuildingCpeIntelligence = {
+  building_id: string;
+  vendor_summary: Record<string, number>;
+  customer_count: number;
+  access_port_count: number;
+  switch_count: number;
+  dark_building: boolean;
+  vilo: {
+    configured: boolean;
+    count: number;
+    firmware_versions: Record<string, number>;
+    dark_candidate_count: number;
+    error?: string;
+    rows: Array<{
+      device_mac: string;
+      classification?: string;
+      inventory_status?: string;
+      device_sn?: string;
+      subscriber_id?: string;
+      subscriber?: { subscriber_id?: string; first_name?: string; last_name?: string; email?: string } | null;
+      subscriber_hint?: { source?: string; label?: string; display?: string } | null;
+      network?: CpeNetworkContext | null;
+      sighting?: { identity?: string; on_interface?: string; port_status?: string; building_id?: string } | null;
+    }>;
+  };
+  tauc: {
+    configured: boolean;
+    count: number;
+    rows: Array<{
+      network_name?: string;
+      site_id?: string;
+      expected_prefix?: string;
+      mac?: string;
+      sn?: string;
+      wan_mode?: string;
+      mesh_nodes?: number;
+    }>;
+  };
+};
+
+type CpeContext = {
+  mac: string;
+  vendor: string;
+  building_id?: string | null;
+  vilo?: {
+    classification?: string;
+    inventory_status?: string;
+    device_sn?: string;
+    subscriber_id?: string;
+    subscriber?: { subscriber_id?: string; first_name?: string; last_name?: string; email?: string } | null;
+    subscriber_hint?: { source?: string; label?: string; display?: string } | null;
+    network?: CpeNetworkContext | null;
+    sighting?: { identity?: string; on_interface?: string; port_status?: string; building_id?: string } | null;
+    error?: string;
+  } | null;
+  tauc?: {
+    network_name?: string;
+    site_id?: string;
+    expected_prefix?: string;
+    wan_mode?: string;
+    mesh_nodes?: number;
+    sn?: string;
+  } | null;
 };
 
 type PortRecord = {
@@ -152,6 +235,7 @@ type BuildingModel = {
     version?: string;
   }>;
   radios: Array<{
+    id?: string;
     name: string;
     type: string;
     model: string;
@@ -220,6 +304,10 @@ type SiteTopology = {
     status?: string;
     from_radio_id?: string;
     to_radio_id?: string;
+    from_latitude?: number | null;
+    from_longitude?: number | null;
+    to_latitude?: number | null;
+    to_longitude?: number | null;
     from_building_id?: string;
     to_building_id?: string;
     inferred?: boolean;
@@ -270,6 +358,7 @@ type BuildingLive = BuildingLayout & {
   recoveryReady?: IssueResponse;
   buildingModel?: BuildingModel;
   profile?: BuildingProfile;
+  cpeIntelligence?: BuildingCpeIntelligence;
 };
 
 type BuildingDataEntry = {
@@ -279,6 +368,7 @@ type BuildingDataEntry = {
   rogueDhcp?: IssueResponse;
   recoveryReady?: IssueResponse;
   buildingModel?: BuildingModel;
+  cpeIntelligence?: BuildingCpeIntelligence;
 };
 
 type TopologyNode = {
@@ -473,6 +563,13 @@ const UI_STATE_STORAGE_KEY = "nycha-noc-ui-state-v1";
 const BUILDING_DATA_BATCH_SIZE = 6;
 
 const BUILDING_PROFILES = buildingProfiles as Record<string, BuildingProfile>;
+const COMPOUND_SITE_OVERRIDES: Record<string, { rootSwitchIdentity: string; members: string[]; mode: "agg-fed branch site" | "switch-fed branch site" }> = {
+  "000007.051": {
+    rootSwitchIdentity: "000007.051.AG01",
+    members: ["000007.052", "000007.060", "000007.061"],
+    mode: "agg-fed branch site",
+  },
+};
 const STATIC_SITE_COORDS = siteCoords as Record<string, SiteCoord>;
 const LEGACY_LAYOUT_BY_SOURCE_ID = new Map(BUILDING_LAYOUTS.map((layout) => [layout.sourceBuildingId, layout]));
 
@@ -535,6 +632,10 @@ function vendorFromMac(mac: string) {
   if (lower.startsWith("30:68:93") || lower.startsWith("60:83:e7") || lower.startsWith("7c:f1:7e") || lower.startsWith("dc:62:79")) return "TP-Link";
   if (lower.startsWith("e8:da:00")) return "Vilo";
   return "Unknown";
+}
+
+function normalizeMac(mac: string | null | undefined) {
+  return String(mac ?? "").trim().toLowerCase();
 }
 
 function titleCaseWords(value: string) {
@@ -641,41 +742,99 @@ function isSwitchLikeIdentity(identity?: string | null) {
 
 function compoundSiteContext(building: BuildingLive, allBuildings: BuildingLive[]) {
   const localBuildingId = canonicalBuildingIdOf(building);
-  const edges = building.buildingModel?.direct_neighbor_edges ?? [];
-  const localSwitches = new Set(
-    [
-      ...(building.buildingModel?.switches.map((entry) => entry.identity) ?? []),
-      ...(building.buildingHealth?.devices.map((entry) => entry.identity) ?? []),
-    ].filter((identity) => isSwitchLikeIdentity(identity)),
-  );
-  const downstreamBySwitch = new Map<string, Set<string>>();
-  for (const edge of edges) {
-    if (!localSwitches.has(edge.from_identity) || !isSwitchLikeIdentity(edge.to_identity)) continue;
-    const remoteBuildingId = buildingIdFromIdentity(edge.to_identity);
-    if (!remoteBuildingId || remoteBuildingId === localBuildingId) continue;
-    const rows = downstreamBySwitch.get(edge.from_identity) ?? new Set<string>();
-    rows.add(remoteBuildingId);
-    downstreamBySwitch.set(edge.from_identity, rows);
+  for (const [rootId, override] of Object.entries(COMPOUND_SITE_OVERRIDES)) {
+    const clusterIds = [rootId, ...override.members];
+    if (!clusterIds.includes(localBuildingId)) continue;
+    const cluster = clusterIds
+      .map((buildingId) => allBuildings.find((entry) => canonicalBuildingIdOf(entry) === buildingId))
+      .filter(isPresent);
+    if (cluster.length < 2) return null;
+    return {
+      rootSwitchIdentity: override.rootSwitchIdentity,
+      mode: override.mode,
+      cluster,
+      downstreamCount: override.members.length,
+    };
   }
-  const ranked = [...downstreamBySwitch.entries()]
-    .map(([switchIdentity, downstream]) => ({ switchIdentity, downstream: [...downstream] }))
-    .sort((a, b) => {
-      const aRank = a.switchIdentity.includes(".AG") ? 2 : a.switchIdentity.includes("RFSW") ? 1 : 0;
-      const bRank = b.switchIdentity.includes(".AG") ? 2 : b.switchIdentity.includes("RFSW") ? 1 : 0;
-      return b.downstream.length - a.downstream.length || bRank - aRank || a.switchIdentity.localeCompare(b.switchIdentity);
-    });
-  const selected = ranked[0];
-  if (!selected || selected.downstream.length === 0) return null;
-  const members = selected.downstream
+  const evaluateRoot = (candidate: BuildingLive) => {
+    const candidateId = canonicalBuildingIdOf(candidate);
+    const edges = candidate.buildingModel?.direct_neighbor_edges ?? [];
+    const localSwitches = new Set(
+      [
+        ...(candidate.buildingModel?.switches.map((entry) => entry.identity) ?? []),
+        ...(candidate.buildingHealth?.devices.map((entry) => entry.identity) ?? []),
+      ].filter((identity) => isSwitchLikeIdentity(identity)),
+    );
+    const localAggSwitches = [...localSwitches].filter((identity) => identity.includes(".AG"));
+    const explicitAggMembers = new Map<string, Set<string>>();
+    for (const aggIdentity of localAggSwitches) {
+      for (const otherBuilding of allBuildings) {
+        const otherId = canonicalBuildingIdOf(otherBuilding);
+        if (otherId === candidateId) continue;
+        for (const edge of otherBuilding.buildingModel?.direct_neighbor_edges ?? []) {
+          if (edge.to_identity !== aggIdentity) continue;
+          const remoteBuildingId = buildingIdFromIdentity(edge.from_identity) ?? otherId;
+          if (!remoteBuildingId || remoteBuildingId === candidateId) continue;
+          const rows = explicitAggMembers.get(aggIdentity) ?? new Set<string>();
+          rows.add(remoteBuildingId);
+          explicitAggMembers.set(aggIdentity, rows);
+        }
+      }
+    }
+    const aggRanked = [...explicitAggMembers.entries()]
+      .map(([switchIdentity, downstream]) => ({ switchIdentity, downstream: [...downstream] }))
+      .sort((a, b) => b.downstream.length - a.downstream.length || a.switchIdentity.localeCompare(b.switchIdentity));
+    if (aggRanked[0]?.downstream.length) {
+      return {
+        root: candidate,
+        rootSwitchIdentity: aggRanked[0].switchIdentity,
+        downstream: aggRanked[0].downstream,
+        mode: "agg-fed branch site" as const,
+      };
+    }
+    const downstreamBySwitch = new Map<string, Set<string>>();
+    for (const edge of edges) {
+      if (!localSwitches.has(edge.from_identity) || !isSwitchLikeIdentity(edge.to_identity)) continue;
+      const remoteBuildingId = buildingIdFromIdentity(edge.to_identity);
+      if (!remoteBuildingId || remoteBuildingId === candidateId) continue;
+      const rows = downstreamBySwitch.get(edge.from_identity) ?? new Set<string>();
+      rows.add(remoteBuildingId);
+      downstreamBySwitch.set(edge.from_identity, rows);
+    }
+    const ranked = [...downstreamBySwitch.entries()]
+      .map(([switchIdentity, downstream]) => ({ switchIdentity, downstream: [...downstream] }))
+      .sort((a, b) => {
+        const aRank = a.switchIdentity.includes(".AG") ? 2 : a.switchIdentity.includes("RFSW") ? 1 : 0;
+        const bRank = b.switchIdentity.includes(".AG") ? 2 : b.switchIdentity.includes("RFSW") ? 1 : 0;
+        return b.downstream.length - a.downstream.length || bRank - aRank || a.switchIdentity.localeCompare(b.switchIdentity);
+      });
+    const selected = ranked[0];
+    if (!selected || selected.downstream.length === 0) return null;
+    return {
+      root: candidate,
+      rootSwitchIdentity: selected.switchIdentity,
+      downstream: selected.downstream,
+      mode: selected.switchIdentity.includes(".AG") ? "agg-fed branch site" : "switch-fed branch site",
+    };
+  };
+
+  const directRoot = evaluateRoot(building);
+  const resolved = directRoot
+    ?? allBuildings
+      .map((candidate) => evaluateRoot(candidate))
+      .filter(isPresent)
+      .find((context) => context.downstream.includes(localBuildingId));
+  if (!resolved) return null;
+  const members = resolved.downstream
     .map((buildingId) => allBuildings.find((entry) => canonicalBuildingIdOf(entry) === buildingId))
-    .filter(isPresent)
-    .slice(0, 3);
-  if (!members.length) return null;
+    .filter(isPresent);
+  const cluster = [resolved.root, ...members.filter((entry) => canonicalBuildingIdOf(entry) !== canonicalBuildingIdOf(resolved.root))];
+  if (cluster.length < 2) return null;
   return {
-    rootSwitchIdentity: selected.switchIdentity,
-    mode: selected.switchIdentity.includes(".AG") ? "agg-fed branch site" : "switch-fed branch site",
-    cluster: [building, ...members],
-    downstreamCount: selected.downstream.length,
+    rootSwitchIdentity: resolved.rootSwitchIdentity,
+    mode: resolved.mode,
+    cluster,
+    downstreamCount: resolved.downstream.length,
   };
 }
 
@@ -1077,6 +1236,165 @@ function unitStatusLabel(unit: Pick<UnitBox, "status" | "port" | "inferred">) {
   return humanStatus(unit.status);
 }
 
+function cpeContextKey(buildingId: string | null | undefined, mac: string | null | undefined) {
+  return `${String(buildingId ?? "").trim()}:${normalizeMac(mac)}`;
+}
+
+function findViloRowByMac(building: BuildingLive, mac: string | null | undefined) {
+  const normalized = normalizeMac(mac);
+  if (!normalized) return null;
+  return building.cpeIntelligence?.vilo.rows.find((row) => normalizeMac(row.device_mac ?? "") === normalized) ?? null;
+}
+
+function findTaucRowByMac(building: BuildingLive, mac: string | null | undefined) {
+  const normalized = normalizeMac(mac);
+  if (!normalized) return null;
+  return building.cpeIntelligence?.tauc.rows.find((row) => normalizeMac(row.mac ?? "") === normalized) ?? null;
+}
+
+function formatUptime(value: string | number | null | undefined) {
+  if (value == null || value === "") return "Unknown";
+  if (typeof value === "number") return `${value}`;
+  return String(value);
+}
+
+function vendorLabel(vendor: string | null | undefined) {
+  switch ((vendor ?? "").toLowerCase()) {
+    case "vilo":
+      return "Vilo";
+    case "tplink":
+      return "TP-Link";
+    case "unknown":
+      return "Unknown";
+    default:
+      return vendor ? vendor : "Unknown";
+  }
+}
+
+function renderValue(value: ReactNode) {
+  return <div style={{ fontSize: 12, color: "#e2e8f0", fontWeight: 600, marginTop: 2 }}>{value}</div>;
+}
+
+function InfoGrid({ items, columns = 2 }: { items: Array<{ label: string; value: ReactNode }>; columns?: number }) {
+  return (
+    <div style={{ display: "grid", gridTemplateColumns: `repeat(${columns}, minmax(0, 1fr))`, gap: 8 }}>
+      {items.map((item) => (
+        <div key={item.label} style={{ background: "#0a0f1a", borderRadius: 8, padding: 10, border: "1px solid #0f172a" }}>
+          <div style={{ fontSize: 9, color: "#475569", marginBottom: 3 }}>{item.label}</div>
+          {renderValue(item.value)}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function CpeContextPanel({
+  vendor,
+  vilo,
+  tauc,
+  compact = false,
+}: {
+  vendor: string;
+  vilo?: {
+    classification?: string;
+    inventory_status?: string;
+    device_sn?: string;
+    subscriber_id?: string;
+    subscriber?: { subscriber_id?: string; first_name?: string; last_name?: string; email?: string } | null;
+    subscriber_hint?: { source?: string; label?: string; display?: string } | null;
+    network?: CpeNetworkContext | null;
+    sighting?: { identity?: string; on_interface?: string; port_status?: string; building_id?: string } | null;
+    error?: string;
+  } | null;
+  tauc?: {
+    network_name?: string;
+    site_id?: string;
+    expected_prefix?: string;
+    wan_mode?: string;
+    mesh_nodes?: number;
+    sn?: string;
+  } | null;
+  compact?: boolean;
+}) {
+  const title = compact ? "CPE CONTEXT" : "LIVE CPE CONTEXT";
+  const boxStyle = { background: "#020617", border: "1px solid #1e293b", borderRadius: 10, padding: 12 } as const;
+
+  if (vilo?.error) {
+    return (
+      <div style={boxStyle}>
+        <div style={{ fontSize: 10, letterSpacing: "0.1em", color: "#475569", marginBottom: 12 }}>{title}</div>
+        <div style={{ fontSize: 11, color: "#fca5a5" }}>Vilo lookup failed: {vilo.error}</div>
+      </div>
+    );
+  }
+
+  if (vilo) {
+    const network = vilo.network;
+    const subscriberName = [vilo.subscriber?.first_name, vilo.subscriber?.last_name].filter(Boolean).join(" ").trim();
+    return (
+      <div style={boxStyle}>
+        <div style={{ fontSize: 10, letterSpacing: "0.1em", color: "#475569", marginBottom: 12 }}>{title}</div>
+        <div style={{ fontSize: 13, color: "#e2e8f0", fontWeight: 700 }}>{network?.network_name ?? "Vilo network"}</div>
+        <div style={{ fontSize: 11, color: "#94a3b8", marginTop: 4 }}>
+          {vendorLabel(vendor)} · {network?.network_status ?? vilo.inventory_status ?? "unknown"}
+        </div>
+        <div style={{ marginTop: 10 }}>
+          <InfoGrid
+            columns={compact ? 1 : 2}
+            items={[
+              { label: "Uptime", value: formatUptime(network?.uptime) },
+              { label: "Clients Online", value: String(network?.device_online_num ?? 0) },
+              { label: "Clients Offline", value: String(network?.device_offline_num ?? 0) },
+              { label: "Firmware", value: network?.firmware_version ?? "Unknown" },
+              { label: "WAN IP", value: network?.wan_ip_address ?? "Unknown" },
+              { label: "Public IP", value: network?.public_ip_address ?? "Unknown" },
+              { label: "Installer", value: network?.installer ?? "Unknown" },
+              { label: "Subscriber", value: subscriberName || vilo.subscriber_hint?.display || vilo.subscriber_id || "Unknown" },
+            ]}
+          />
+        </div>
+        {network?.flags?.length ? (
+          <div style={{ display: "grid", gap: 6, marginTop: 10 }}>
+            {network.flags.map((flag) => (
+              <div key={flag} style={{ fontSize: 10, color: "#fbbf24", padding: "7px 9px", borderRadius: 8, border: "1px solid #78350f", background: "#1c1917" }}>
+                {flag}
+              </div>
+            ))}
+          </div>
+        ) : null}
+      </div>
+    );
+  }
+
+  if (tauc) {
+    return (
+      <div style={boxStyle}>
+        <div style={{ fontSize: 10, letterSpacing: "0.1em", color: "#475569", marginBottom: 12 }}>{title}</div>
+        <div style={{ fontSize: 13, color: "#e2e8f0", fontWeight: 700 }}>{tauc.network_name ?? "TP-Link network"}</div>
+        <div style={{ fontSize: 11, color: "#94a3b8", marginTop: 4 }}>{vendorLabel(vendor)} · ACS-backed context</div>
+        <div style={{ marginTop: 10 }}>
+          <InfoGrid
+            columns={compact ? 1 : 2}
+            items={[
+              { label: "WAN Mode", value: tauc.wan_mode ?? "Unknown" },
+              { label: "Mesh Nodes", value: String(tauc.mesh_nodes ?? 0) },
+              { label: "Serial", value: tauc.sn ?? "Unknown" },
+              { label: "Expected Prefix", value: tauc.expected_prefix ?? "Unknown" },
+            ]}
+          />
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div style={boxStyle}>
+      <div style={{ fontSize: 10, letterSpacing: "0.1em", color: "#475569", marginBottom: 12 }}>{title}</div>
+      <div style={{ fontSize: 11, color: "#64748b" }}>No cloud-side Vilo or TAUC context is currently available for this CPE.</div>
+    </div>
+  );
+}
+
 function UnitPrismButton({ unit, selected, onSelectUnit, onInspectPort, compact = false }: UnitPrismProps) {
   const face = unitFaceColor(unit);
   const topFill = `${face}80`;
@@ -1162,8 +1480,15 @@ function buildUnitBoxes(building: BuildingLive, ports: PortWithStatus[]) {
     building.buildingHealth?.probable_cpe_count ?? 0,
     8,
   );
+  const hasAuthoritativeUnitInventory = Boolean(
+    sortedKnownUnits.length
+    || (building.buildingModel?.exact_unit_port_matches?.length ?? 0)
+    || (building.buildingModel?.coverage?.known_unit_count ?? 0),
+  );
   const templateLabels = canonicalBuildingIdOf(building) === "000007.055"
-    ? (sortedKnownUnits.length ? sortedKnownUnits : towerResidentialTemplate())
+    ? (hasAuthoritativeUnitInventory
+        ? (sortedKnownUnits.length ? sortedKnownUnits : towerResidentialTemplate())
+        : [])
     : sortedKnownUnits.length
       ? sortedKnownUnits
       : synthesizeUnitLabels(proxyUnitCount, inferredFloorCount);
@@ -1226,15 +1551,16 @@ function buildUnitBoxes(building: BuildingLive, ports: PortWithStatus[]) {
   const unitDecisionMap = new Map((building.buildingModel?.unit_state_decisions ?? []).map((row) => [row.unit, row]));
 
   return templateLabels.map((unit, index) => {
+    const isInferred = !sortedKnownUnits.length || !explicitPortByUnit.has(unit);
     const port = explicitPortByUnit.get(unit) ?? (!sortedKnownUnits.length ? (sortedPorts[index] ?? null) : null);
     const decision = unitDecisionMap.get(unit);
     return {
       unit,
       floor: unitFloor(unit),
       port,
-      inferred: !sortedKnownUnits.length || !explicitPortByUnit.has(unit),
-      status: port?.status ?? (decision?.state as Status | undefined) ?? (
-        sortedKnownUnits.includes(unit) || canonicalBuildingIdOf(building) === "000007.055"
+      inferred: isInferred,
+      status: (isInferred && !sortedKnownUnits.length) ? "unknown" : port?.status ?? (decision?.state as Status | undefined) ?? (
+        sortedKnownUnits.includes(unit)
           ? "unknown"
           : building.status === "offline"
             ? "offline"
@@ -1773,6 +2099,8 @@ function WireframeTwinView({
   building,
   units,
   selectedUnit,
+  selectedUnitVilo,
+  selectedUnitTauc,
   onSelectUnit,
   onInspectPort,
   onOpenDevice,
@@ -1784,6 +2112,8 @@ function WireframeTwinView({
   building: BuildingLive;
   units: UnitBox[];
   selectedUnit: UnitBox | null;
+  selectedUnitVilo: BuildingCpeIntelligence["vilo"]["rows"][number] | null;
+  selectedUnitTauc: BuildingCpeIntelligence["tauc"]["rows"][number] | null;
   onSelectUnit: (unit: UnitBox) => void;
   onInspectPort: (port: PortWithStatus) => void;
   onOpenDevice: (identity: string) => void;
@@ -1804,7 +2134,9 @@ function WireframeTwinView({
   const totalFloors = Math.max(displayFloorCount(building), ...allFloors, 1);
   const floors = Array.from({ length: totalFloors }, (_, index) => totalFloors - index);
   const isTower = building.profile?.massingType === "tower" || canonicalBuildingIdOf(building) === "000007.055";
-  const maxCols = isTower ? 13 : Math.max(...floors.map((floor) => (grouped.get(floor) ?? []).length), 1);
+  const hasUnitInventory = units.length > 0;
+  const towerGridCols = hasUnitInventory ? 13 : 4;
+  const maxCols = isTower ? towerGridCols : Math.max(...floors.map((floor) => (grouped.get(floor) ?? []).length), 1);
   const towerLetters = "ABCDEFGHIJKLM".split("");
   const router = coreDevices.find((device) => device.identity.endsWith(".R01")) ?? null;
   const roofLabel = isTower && router
@@ -1818,6 +2150,27 @@ function WireframeTwinView({
       count: units.filter((unit) => unit.port?.identity === device.identity).length,
     }))
     .sort((a, b) => a.floor - b.floor || a.label.localeCompare(b.label));
+  const switchChain = useMemo(
+    () => buildLocalSwitchChain(building, [...coreDevices, ...roofSwitches, ...accessSwitches]),
+    [accessSwitches, building, coreDevices, roofSwitches],
+  );
+  const displaySwitchStack = useMemo(() => {
+    const accessByIdentity = new Map(accessSwitches.map((device) => [device.identity, device]));
+    const ordered = switchChain
+      .filter((identity) => accessByIdentity.has(identity))
+      .map((identity) => accessByIdentity.get(identity)!)
+      .filter(isPresent);
+    const seen = new Set(ordered.map((device) => device.identity));
+    const remainder = accessSwitches
+      .filter((device) => !seen.has(device.identity))
+      .sort((a, b) => humanizeIdentity(a.identity).localeCompare(humanizeIdentity(b.identity), undefined, { numeric: true }));
+    return [...ordered, ...remainder].map((device, index) => ({
+      device,
+      label: device.identity.split(".").slice(-1)[0],
+      stackIndex: index,
+      count: units.filter((unit) => unit.port?.identity === device.identity).length,
+    }));
+  }, [accessSwitches, switchChain, units]);
   const switchesByFloor = new Map<number, typeof switchPlacements>();
   for (const placement of switchPlacements) {
     const row = switchesByFloor.get(placement.floor) ?? [];
@@ -1855,27 +2208,18 @@ function WireframeTwinView({
     }
     return byIdentity;
   }, [building.buildingModel?.switches, switchPlacements]);
-  const switchChain = useMemo(
-    () => buildLocalSwitchChain(building, [...coreDevices, ...roofSwitches, ...accessSwitches]),
-    [accessSwitches, building, coreDevices, roofSwitches],
-  );
   const internalSwitchLinks = useMemo(() => {
-    const localIds = new Set([
-      ...roofSwitches.map((device) => device.identity),
-      ...accessSwitches.map((device) => device.identity),
-      ...coreDevices.filter((device) => device.identity.includes(".R01")).map((device) => device.identity),
-    ]);
-    const seen = new Set<string>();
-    return (building.buildingModel?.direct_neighbor_edges ?? [])
-      .filter((edge) => localIds.has(edge.from_identity) && localIds.has(edge.to_identity))
-      .map((edge) => {
-        const pair = [edge.from_identity, edge.to_identity].sort().join("::");
-        if (seen.has(pair)) return null;
-        seen.add(pair);
-        return { from: edge.from_identity, to: edge.to_identity };
-      })
-      .filter(isPresent);
-  }, [accessSwitches, building.buildingModel?.direct_neighbor_edges, coreDevices, roofSwitches]);
+    const chainNodes = [
+      ...(roofSwitches[0] ? [roofSwitches[0].identity] : []),
+      ...(isTower && router ? [router.identity] : []),
+      ...displaySwitchStack.map((entry) => entry.device.identity),
+    ];
+    const ordered = Array.from(new Map(chainNodes.map((identity) => [identity, identity])).values());
+    return ordered.slice(0, -1).map((identity, index) => ({
+      from: identity,
+      to: ordered[index + 1],
+    }));
+  }, [displaySwitchStack, isTower, roofSwitches, router]);
   const hoveredSwitch = (selectedSwitchId ?? hoveredSwitchId) ? switchDetailsByIdentity.get(selectedSwitchId ?? hoveredSwitchId ?? "") ?? null : null;
   const hasMappedUnits = units.some((unit) => unit.port);
   const genericCellWidth = 32;
@@ -1907,14 +2251,11 @@ function WireframeTwinView({
       y: genericRoofSwitchCenterY,
     });
   }
-  floors.forEach((floor, floorIndex) => {
-    const rowTop = genericFacadeTop + 20 + floorIndex * (genericCellHeight + genericCellGapY);
-    const floorSwitches = switchesByFloor.get(floor) ?? [];
-    floorSwitches.forEach((placement, index) => {
-      genericSwitchCenters.set(placement.device.identity, {
-        x: genericSwitchLabelX + index * 78 + 32,
-        y: rowTop + genericCellHeight / 2,
-      });
+  displaySwitchStack.forEach((placement, index) => {
+    const spacing = displaySwitchStack.length > 1 ? (genericFacadeBottom - genericFacadeTop - 80) / Math.max(displaySwitchStack.length - 1, 1) : 0;
+    genericSwitchCenters.set(placement.device.identity, {
+      x: genericSwitchLabelX + 32,
+      y: genericFacadeTop + 40 + index * spacing,
     });
   });
 
@@ -2140,9 +2481,10 @@ function WireframeTwinView({
                     {floors.map((floor) => {
                       const row = grouped.get(floor) ?? [];
                       const paddedRow = isTower
-                        ? towerLetters.map((letter) => row.find((unit) => unitSuffixLetter(unit.unit) === letter) ?? null)
+                        ? (hasUnitInventory
+                            ? towerLetters.slice(0, maxCols).map((letter) => row.find((unit) => unitSuffixLetter(unit.unit) === letter) ?? null)
+                            : Array.from({ length: maxCols }, () => null))
                         : [...row, ...Array.from({ length: Math.max(0, maxCols - row.length) }, () => null)];
-                      const floorSwitches = switchesByFloor.get(floor) ?? [];
                       return (
                         <Fragment key={floor}>
                           <div style={{ display: "grid", placeItems: "center", color: "#64748b", fontSize: 10, fontWeight: 800, borderRight: "1px solid rgba(100,116,139,0.7)" }}>
@@ -2164,33 +2506,14 @@ function WireframeTwinView({
                           )}
                           <div style={{ position: "relative", display: "flex", alignItems: "center", gap: 6, paddingLeft: 12 }}>
                             {floor === 1 ? (
-                              <div style={{ fontSize: 10, color: "#94a3b8", fontWeight: 700 }}>Offices / no customer CPEs</div>
+                              <div style={{ fontSize: 10, color: "#94a3b8", fontWeight: 700 }}>
+                                {hasUnitInventory ? "Offices / no customer CPEs" : "Infrastructure riser / unit map pending"}
+                              </div>
+                            ) : !hasUnitInventory && floor === totalFloors ? (
+                              <div style={{ fontSize: 10, color: "#64748b", fontWeight: 700 }}>3D tower shell restored</div>
                             ) : (
                               <>
                                 <div style={{ position: "absolute", left: 0, top: "50%", width: 12, height: 2, background: "rgba(56,189,248,0.55)", transform: "translateY(-50%)" }} />
-                                {floorSwitches.map((placement) => (
-                                  <div
-                                    key={placement.device.identity}
-                                    title={`${placement.device.identity} · ${placement.count} units`}
-                                    onMouseEnter={() => setHoveredSwitchId(placement.device.identity)}
-                                    onMouseLeave={() => setHoveredSwitchId((current) => (current === placement.device.identity ? null : current))}
-                                    onClick={() => setSelectedSwitchId((current) => (current === placement.device.identity ? null : placement.device.identity))}
-                                    style={{
-                                      minWidth: 52,
-                                      padding: "5px 8px",
-                                      borderRadius: 8,
-                                      border: `1px solid ${selectedSwitchId === placement.device.identity ? "#38bdf8" : "#22c55e"}`,
-                                      background: selectedSwitchId === placement.device.identity ? "#082f49" : "#052e16",
-                                      color: "#dcfce7",
-                                      fontSize: 9,
-                                      fontWeight: 800,
-                                      textAlign: "center",
-                                      cursor: "pointer",
-                                    }}
-                                  >
-                                    {placement.label}
-                                  </div>
-                                ))}
                               </>
                             )}
                           </div>
@@ -2215,29 +2538,45 @@ function WireframeTwinView({
                   >
                     <div style={{ color: "#64748b", fontSize: 10, fontWeight: 800 }}>BASEMENT</div>
                     <div style={{ color: "#475569", fontSize: 10, fontWeight: 700 }}>{building.profile?.basementLabel ?? "Basement"}</div>
-                    <div style={{ display: "flex", gap: 8 }}>
-                      {switchPlacements.filter((placement) => placement.floor === 0).map((placement) => (
-                        <div
-                          key={placement.device.identity}
-                          onMouseEnter={() => setHoveredSwitchId(placement.device.identity)}
-                          onMouseLeave={() => setHoveredSwitchId((current) => (current === placement.device.identity ? null : current))}
-                          onClick={() => setSelectedSwitchId((current) => (current === placement.device.identity ? null : placement.device.identity))}
-                          style={{
-                            padding: "5px 10px",
-                            borderRadius: 8,
-                            border: `1px solid ${selectedSwitchId === placement.device.identity ? "#38bdf8" : "#22c55e"}`,
-                            background: selectedSwitchId === placement.device.identity ? "#082f49" : "#052e16",
-                            color: "#dcfce7",
-                            fontSize: 9,
-                            fontWeight: 800,
-                            cursor: "pointer",
-                          }}
-                        >
-                          {placement.label}
-                        </div>
-                      ))}
+                    <div style={{ fontSize: 10, color: "#475569", fontWeight: 700 }}>
+                      {hasUnitInventory ? "Switch stack at right" : "Infrastructure-only tower view"}
                     </div>
                   </div>
+                </div>
+                <div
+                  style={{
+                    position: "absolute",
+                    right: 18,
+                    top: 108,
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: 14,
+                    alignItems: "stretch",
+                    zIndex: 3,
+                  }}
+                >
+                  {displaySwitchStack.map((placement) => (
+                    <div
+                      key={placement.device.identity}
+                      onMouseEnter={() => setHoveredSwitchId(placement.device.identity)}
+                      onMouseLeave={() => setHoveredSwitchId((current) => (current === placement.device.identity ? null : current))}
+                      onClick={() => setSelectedSwitchId((current) => (current === placement.device.identity ? null : placement.device.identity))}
+                      style={{
+                        minWidth: 64,
+                        padding: "6px 10px",
+                        borderRadius: 8,
+                        border: `1px solid ${selectedSwitchId === placement.device.identity ? "#38bdf8" : "#22c55e"}`,
+                        background: selectedSwitchId === placement.device.identity ? "#082f49" : "#052e16",
+                        color: "#dcfce7",
+                        fontSize: 10,
+                        fontWeight: 800,
+                        textAlign: "center",
+                        cursor: "pointer",
+                      }}
+                    >
+                      {placement.label}
+                    </div>
+                  ))}
                 </div>
               </div>
             ) : (
@@ -2375,7 +2714,6 @@ function WireframeTwinView({
                   {floors.map((floor, floorIndex) => {
                     const row = grouped.get(floor) ?? [];
                     const paddedRow = [...row, ...Array.from({ length: Math.max(0, maxCols - row.length) }, () => null)];
-                    const floorSwitches = switchesByFloor.get(floor) ?? [];
                     const rowTop = genericFacadeTop + 20 + floorIndex * (genericCellHeight + genericCellGapY);
                     const rowBottom = rowTop + genericCellHeight;
                     return (
@@ -2417,22 +2755,27 @@ function WireframeTwinView({
                         })}
                         {/* Switch connector */}
                         <line x1={genericSwitchRailX - 14} y1={rowTop + genericCellHeight / 2} x2={genericSwitchRailX} y2={rowTop + genericCellHeight / 2} stroke="rgba(56,189,248,0.75)" strokeWidth="2" />
-                        {floorSwitches.map((placement, index) => (
-                          <g
-                            key={placement.device.identity}
-                            transform={`translate(${genericSwitchLabelX + index * 78}, ${rowTop + genericCellHeight / 2 - 12})`}
-                            onMouseEnter={() => setHoveredSwitchId(placement.device.identity)}
-                            onMouseLeave={() => setHoveredSwitchId((cur) => cur === placement.device.identity ? null : cur)}
-                            onClick={() => setSelectedSwitchId((current) => (current === placement.device.identity ? null : placement.device.identity))}
-                            style={{ cursor: "default" }}
-                          >
-                            <rect x="0" y="0" width="64" height="24" rx="6" fill={selectedSwitchId === placement.device.identity ? "#082f49" : "#052e16"} stroke={selectedSwitchId === placement.device.identity ? "#38bdf8" : "#22c55e"} />
-                            <text x="32" y="16" fill="#dcfce7" fontSize="10" fontWeight="800" textAnchor="middle">{placement.label}</text>
-                          </g>
-                        ))}
                         {/* Floor divider */}
                         <line x1={genericFacadeLeft} y1={rowBottom} x2={genericFacadeRight} y2={rowBottom} stroke="rgba(56,189,248,0.18)" strokeWidth="1" />
                       </Fragment>
+                    );
+                  })}
+
+                  {displaySwitchStack.map((placement) => {
+                    const center = genericSwitchCenters.get(placement.device.identity);
+                    if (!center) return null;
+                    return (
+                      <g
+                        key={placement.device.identity}
+                        transform={`translate(${center.x - 32}, ${center.y - 12})`}
+                        onMouseEnter={() => setHoveredSwitchId(placement.device.identity)}
+                        onMouseLeave={() => setHoveredSwitchId((cur) => cur === placement.device.identity ? null : cur)}
+                        onClick={() => setSelectedSwitchId((current) => (current === placement.device.identity ? null : placement.device.identity))}
+                        style={{ cursor: "pointer" }}
+                      >
+                        <rect x="0" y="0" width="64" height="24" rx="6" fill={selectedSwitchId === placement.device.identity ? "#082f49" : "#052e16"} stroke={selectedSwitchId === placement.device.identity ? "#38bdf8" : "#22c55e"} />
+                        <text x="32" y="16" fill="#dcfce7" fontSize="10" fontWeight="800" textAnchor="middle">{placement.label}</text>
+                      </g>
                     );
                   })}
 
@@ -2548,6 +2891,32 @@ function WireframeTwinView({
                 >
                   Open CPE Port Detail
                 </button>
+              ) : null}
+              {selectedUnit.port ? (
+                <div style={{ marginTop: 12 }}>
+                  <CpeContextPanel
+                    compact
+                    vendor={vendorFromMac(selectedUnit.port.mac)}
+                    vilo={selectedUnitVilo ? {
+                      classification: selectedUnitVilo.classification,
+                      inventory_status: selectedUnitVilo.inventory_status,
+                      device_sn: selectedUnitVilo.device_sn,
+                      subscriber_id: selectedUnitVilo.subscriber_id,
+                      subscriber: selectedUnitVilo.subscriber,
+                      subscriber_hint: selectedUnitVilo.subscriber_hint,
+                      network: selectedUnitVilo.network,
+                      sighting: selectedUnitVilo.sighting,
+                    } : null}
+                    tauc={selectedUnitTauc ? {
+                      network_name: selectedUnitTauc.network_name,
+                      site_id: selectedUnitTauc.site_id,
+                      expected_prefix: selectedUnitTauc.expected_prefix,
+                      wan_mode: selectedUnitTauc.wan_mode,
+                      mesh_nodes: selectedUnitTauc.mesh_nodes,
+                      sn: selectedUnitTauc.sn,
+                    } : null}
+                  />
+                </div>
               ) : null}
               <div style={{ fontSize: 10, color: "#64748b", marginTop: 12 }}>
                 {selectedUnit.port
@@ -2741,11 +3110,10 @@ function MapView({
     );
     return (siteTopology?.radio_links ?? [])
       .filter((link) => (link.kind ?? "").toLowerCase() === "cambium")
-      .filter((link) => Boolean(link.from_building_id && link.to_building_id))
       .filter((link) => {
         const fromBuildingId = link.from_building_id ? String(link.from_building_id) : "";
         const toBuildingId = link.to_building_id ? String(link.to_building_id) : "";
-        return !sikluBuildingPairs.has([fromBuildingId, toBuildingId].sort().join("::"));
+        return !(fromBuildingId && toBuildingId && sikluBuildingPairs.has([fromBuildingId, toBuildingId].sort().join("::")));
       })
       .map((link) => {
         const fromBuilding =
@@ -2760,7 +3128,7 @@ function MapView({
         const toRadio = link.to_radio_id
           ? byRadioId.get(link.to_radio_id)
           : radios.find((radio) => radioMatchesEndpoint(radio, link.to_label, null));
-        const preferRadioEndpoints = !(fromBuilding && toBuilding);
+        const preferRadioEndpoints = Boolean(fromRadio || toRadio);
         const fromCoord = preferRadioEndpoints
           ? fromRadio ? radioCoord(fromRadio, siteTopology) : fromBuilding ? getCoord(fromBuilding.address, siteTopology, canonicalBuildingIdOf(fromBuilding)) : null
           : fromBuilding ? getCoord(fromBuilding.address, siteTopology, canonicalBuildingIdOf(fromBuilding)) : fromRadio ? radioCoord(fromRadio, siteTopology) : null;
@@ -3261,6 +3629,8 @@ function BuildingView({
   const [summaryFocus, setSummaryFocus] = useState<SummaryFocus>(null);
   const [selectedDeviceIdentity, setSelectedDeviceIdentity] = useState<string | null>(null);
   const selectedUnit = unitBoxes.find((unit) => unit.unit === selectedUnitId) ?? unitBoxes[0] ?? null;
+  const selectedUnitVilo = selectedUnit?.port ? findViloRowByMac(building, selectedUnit.port.mac) : null;
+  const selectedUnitTauc = selectedUnit?.port ? findTaucRowByMac(building, selectedUnit.port.mac) : null;
   const portsByIssueKey = useMemo(() => new Map(ports.map((port) => [portKey(port.identity, port.on_interface), port])), [ports]);
   const sortedFlapPorts = useMemo(
     () => [...(building.flapHistory?.ports ?? [])].sort((a, b) => a.identity.localeCompare(b.identity) || compareInterfaceLabels(a.interface, b.interface)),
@@ -3312,7 +3682,7 @@ function BuildingView({
       });
     }
     return byIdentity;
-  }, [building.buildingModel?.direct_neighbor_edges, building.buildingModel?.switches, devices]);
+  }, [building.buildingModel?.direct_neighbor_edges, building.buildingModel?.switches, building.buildingHealth?.devices]);
   const selectedDevice = selectedDeviceIdentity ? deviceDetailMap.get(selectedDeviceIdentity) ?? null : null;
   const openDeviceDetails = (identity: string) => {
     setSelectedDeviceIdentity(identity);
@@ -3374,13 +3744,15 @@ function BuildingView({
         building={building}
         units={unitBoxes}
         selectedUnit={selectedUnit}
+        selectedUnitVilo={selectedUnitVilo}
+        selectedUnitTauc={selectedUnitTauc}
         onSelectUnit={(unit) => setSelectedUnitId(unit.unit)}
         onInspectPort={onSelectPort}
         onOpenDevice={openDeviceDetails}
         selectedRadio={selectedRadio}
         roofSwitches={roofSwitches}
         accessSwitches={accessSwitches}
-        coreDevices={devices}
+        coreDevices={building.buildingHealth?.devices ?? []}
         />
       </div>
 
@@ -3407,8 +3779,45 @@ function BuildingView({
                 ? `${building.buildingModel.coverage.exact_unit_port_match_count} exact unit-port matches out of ${building.buildingModel.coverage.known_unit_count} units for this building (${exactCoverage}% coverage). ${building.buildingModel.data_gaps.switch_floor_placement}`
                 : "Switch floor placement is inferred from the unit floors served by each access switch. Unit-to-port mappings stay tied to verified inventory when unit labels exist and fall back to deterministic port-order inference otherwise."}
           </div>
-          </div>
         </div>
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, marginBottom: 16 }}>
+        <div style={{ background: "#020617", border: "1px solid #1e293b", borderRadius: 10, padding: 14 }}>
+          <div style={{ fontSize: 10, letterSpacing: "0.1em", color: "#475569", marginBottom: 12 }}>CPE DEPLOYMENT</div>
+          <InfoGrid
+            items={[
+              { label: "Live CPEs", value: String(building.cpeIntelligence?.customer_count ?? building.customerCount) },
+              { label: "Access Ports", value: String(building.cpeIntelligence?.access_port_count ?? building.buildingCustomerCount?.access_port_count ?? 0) },
+              { label: "Vilo", value: String(building.cpeIntelligence?.vendor_summary?.vilo ?? 0) },
+              { label: "TP-Link", value: String(building.cpeIntelligence?.vendor_summary?.tplink ?? 0) },
+              { label: "Dark Building", value: building.cpeIntelligence?.dark_building ? "Yes" : "No" },
+              { label: "Top Firmware", value: Object.entries(building.cpeIntelligence?.vilo.firmware_versions ?? {})[0]?.join(" · ") ?? "Unknown" },
+            ]}
+          />
+        </div>
+        <CpeContextPanel
+          vendor={selectedUnit?.port ? vendorFromMac(selectedUnit.port.mac) : "unknown"}
+          vilo={selectedUnitVilo ? {
+            classification: selectedUnitVilo.classification,
+            inventory_status: selectedUnitVilo.inventory_status,
+            device_sn: selectedUnitVilo.device_sn,
+            subscriber_id: selectedUnitVilo.subscriber_id,
+            subscriber: selectedUnitVilo.subscriber,
+            subscriber_hint: selectedUnitVilo.subscriber_hint,
+            network: selectedUnitVilo.network,
+            sighting: selectedUnitVilo.sighting,
+          } : null}
+          tauc={selectedUnitTauc ? {
+            network_name: selectedUnitTauc.network_name,
+            site_id: selectedUnitTauc.site_id,
+            expected_prefix: selectedUnitTauc.expected_prefix,
+            wan_mode: selectedUnitTauc.wan_mode,
+            mesh_nodes: selectedUnitTauc.mesh_nodes,
+            sn: selectedUnitTauc.sn,
+          } : null}
+        />
+      </div>
 
       <TopologyBranchPanel building={building} devices={devices} selectedRadio={selectedRadio} />
 
@@ -3757,11 +4166,13 @@ function PortView({
   building,
   port,
   path,
+  cpeContext,
   onBack,
 }: {
   building: BuildingLive;
   port: PortWithStatus;
   path: Array<{ label: string; status: Status }>;
+  cpeContext: CpeContext | null;
   onBack: () => void;
 }) {
   return (
@@ -3814,19 +4225,18 @@ function PortView({
         <div>
           <div style={{ background: "#020617", border: "1px solid #1e293b", borderRadius: 10, padding: 14, marginBottom: 12 }}>
             <div style={{ fontSize: 10, letterSpacing: "0.1em", color: "#475569", marginBottom: 12 }}>PORT FACTS</div>
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
-              {[
+            <InfoGrid
+              items={[
                 { label: "Switch IP", value: port.ip },
                 { label: "MAC", value: port.mac },
-                { label: "Vendor", value: vendorFromMac(port.mac) },
+                { label: "Vendor", value: vendorLabel(cpeContext?.vendor ?? vendorFromMac(port.mac)) },
                 { label: "VLAN", value: String(port.vid) },
-              ].map((item) => (
-                <div key={item.label} style={{ background: "#0a0f1a", borderRadius: 8, padding: 10, border: "1px solid #0f172a" }}>
-                  <div style={{ fontSize: 9, color: "#475569", marginBottom: 3 }}>{item.label}</div>
-                  <div style={{ fontSize: 12, fontWeight: 600, color: "#e2e8f0" }}>{item.value}</div>
-                </div>
-              ))}
-            </div>
+              ]}
+            />
+          </div>
+
+          <div style={{ marginBottom: 12 }}>
+            <CpeContextPanel vendor={cpeContext?.vendor ?? vendorFromMac(port.mac)} vilo={cpeContext?.vilo ?? null} tauc={cpeContext?.tauc ?? null} />
           </div>
 
           <div style={{ background: "#020617", border: "1px solid #1e293b", borderRadius: 10, padding: 14 }}>
@@ -3852,9 +4262,11 @@ export default function NychaNoc() {
   const [selectedBuildingId, setSelectedBuildingId] = useState<string | null>(null);
   const [selectedPortKey, setSelectedPortKey] = useState<string | null>(null);
   const [selectedRadioId, setSelectedRadioId] = useState<string | null>(null);
+  const [buildingBlocksOpen, setBuildingBlocksOpen] = useState(false);
   const [siteSummary, setSiteSummary] = useState<SiteSummary | null>(null);
   const [siteTopology, setSiteTopology] = useState<SiteTopology | null>(null);
   const [buildingData, setBuildingData] = useState<Record<string, BuildingDataEntry>>({});
+  const [cpeContextData, setCpeContextData] = useState<Record<string, CpeContext>>({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const restoredUiStateRef = useRef(false);
@@ -4106,6 +4518,7 @@ export default function NychaNoc() {
         flapHistory: live?.flapHistory,
         rogueDhcp: live?.rogueDhcp,
         recoveryReady: live?.recoveryReady,
+        cpeIntelligence: live?.cpeIntelligence,
       };
     });
   }, [buildingData, buildingLayouts, siteSummary, siteTopology]);
@@ -4172,6 +4585,32 @@ export default function NychaNoc() {
 
   const selectedBuilding = buildings.find((building) => building.id === selectedBuildingId) ?? buildings[0] ?? null;
   const selectedBuildingLoadingModel = selectedBuilding ? !hasHydratedBuildingData(buildingData[canonicalBuildingIdOf(selectedBuilding)]) : false;
+  useEffect(() => {
+    if (!selectedBuilding) return;
+    const buildingId = canonicalBuildingIdOf(selectedBuilding);
+    if (!/^\d{6}\.\d{3}$/.test(buildingId)) return;
+    if (buildingData[buildingId]?.cpeIntelligence) return;
+    let active = true;
+    void (async () => {
+      try {
+        const baseUrl = DEFAULT_JAKE_BASE_URL;
+        const cpeIntelligence = await fetchJakeJson<BuildingCpeIntelligence>(baseUrl, `/v1/jake/buildings/${buildingId}/cpes?limit=200`);
+        if (!active) return;
+        setBuildingData((prev) => ({
+          ...prev,
+          [buildingId]: {
+            ...prev[buildingId],
+            cpeIntelligence,
+          },
+        }));
+      } catch {
+        // leave CPE intelligence absent when upstream systems are unavailable
+      }
+    })();
+    return () => {
+      active = false;
+    };
+  }, [buildingData, selectedBuilding]);
   const radios = useMemo<RadioLive[]>(() => {
     if (siteTopology?.radios?.length) {
       const grouped = new Map<string, SiteTopology["radios"]>();
@@ -4367,6 +4806,66 @@ export default function NychaNoc() {
 
   const selectedPort =
     selectedBuildingPorts.find((port) => portRenderKey(port) === selectedPortKey) ?? selectedBuildingPorts[0] ?? null;
+  const selectedPortCpeKey = selectedBuilding && selectedPort ? cpeContextKey(canonicalBuildingIdOf(selectedBuilding), selectedPort.mac) : null;
+  const selectedPortCpeContext =
+    selectedPortCpeKey
+      ? cpeContextData[selectedPortCpeKey]
+        ?? {
+          mac: normalizeMac(selectedPort?.mac ?? ""),
+          vendor: vendorFromMac(selectedPort?.mac ?? ""),
+          building_id: canonicalBuildingIdOf(selectedBuilding!),
+          vilo: selectedBuilding ? (() => {
+            const row = findViloRowByMac(selectedBuilding, selectedPort?.mac);
+            return row ? {
+              classification: row.classification,
+              inventory_status: row.inventory_status,
+              device_sn: row.device_sn,
+              subscriber_id: row.subscriber_id,
+              subscriber: row.subscriber,
+              subscriber_hint: row.subscriber_hint,
+              network: row.network,
+              sighting: row.sighting,
+            } : null;
+          })() : null,
+          tauc: selectedBuilding ? (() => {
+            const row = findTaucRowByMac(selectedBuilding, selectedPort?.mac);
+            return row ? {
+              network_name: row.network_name,
+              site_id: row.site_id,
+              expected_prefix: row.expected_prefix,
+              wan_mode: row.wan_mode,
+              mesh_nodes: row.mesh_nodes,
+              sn: row.sn,
+            } : null;
+          })() : null,
+        }
+      : null;
+
+  useEffect(() => {
+    if (!selectedBuilding || !selectedPort) return;
+    const buildingId = canonicalBuildingIdOf(selectedBuilding);
+    const mac = normalizeMac(selectedPort.mac);
+    if (!buildingId || !mac) return;
+    const key = cpeContextKey(buildingId, mac);
+    if (cpeContextData[key]) return;
+    let active = true;
+    void (async () => {
+      try {
+        const baseUrl = DEFAULT_JAKE_BASE_URL;
+        const result = await fetchJakeJson<CpeContext>(baseUrl, `/v1/jake/cpe-context?mac=${encodeURIComponent(mac)}&building_id=${encodeURIComponent(buildingId)}`);
+        if (!active) return;
+        setCpeContextData((prev) => ({
+          ...prev,
+          [key]: result,
+        }));
+      } catch {
+        // keep local building-derived fallback if cloud context is unavailable
+      }
+    })();
+    return () => {
+      active = false;
+    };
+  }, [cpeContextData, selectedBuilding, selectedPort]);
 
   const breadcrumb = [
     { label: "NYCHA Map", view: "map" as const },
@@ -4378,6 +4877,16 @@ export default function NychaNoc() {
   const onlineBuildings = buildings.filter((building) => building.status === "online").length;
   const degradedBuildings = buildings.filter((building) => building.status === "degraded").length;
   const offlineBuildings = buildings.filter((building) => building.status === "offline").length;
+  const sidebarBuildings = useMemo(() => {
+    const byId = new Map<string, BuildingLive>();
+    for (const building of buildings) {
+      const key = canonicalBuildingIdOf(building);
+      if (!byId.has(key)) {
+        byId.set(key, building);
+      }
+    }
+    return [...byId.values()].sort((a, b) => a.shortLabel.localeCompare(b.shortLabel, undefined, { numeric: true }));
+  }, [buildings]);
   const siteAlerts = siteSummary?.active_alerts ?? [];
   const selectedPortPath: Array<{ label: string; status: Status }> =
     selectedBuilding && selectedPort
@@ -4501,6 +5010,7 @@ export default function NychaNoc() {
               building={selectedBuilding}
               port={selectedPort}
               path={selectedPortPath}
+              cpeContext={selectedPortCpeContext}
               onBack={() => setView("building")}
             />
           ) : null}
@@ -4552,10 +5062,33 @@ export default function NychaNoc() {
             </div>
           </div>
 
-          <div style={{ fontSize: 10, letterSpacing: "0.1em", color: "#475569", margin: "16px 0 10px" }}>BUILDING BLOCKS</div>
-          {buildings.map((building) => (
+          <button
+            onClick={() => setBuildingBlocksOpen((open) => !open)}
+            style={{
+              width: "100%",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              gap: 12,
+              background: "#0a0f1a",
+              border: "1px solid #0f172a",
+              borderRadius: 8,
+              padding: "10px 12px",
+              cursor: "pointer",
+              margin: "16px 0 10px",
+              color: "#cbd5e1",
+              fontFamily: "inherit",
+            }}
+          >
+            <span style={{ fontSize: 10, letterSpacing: "0.1em", color: "#475569" }}>BUILDING BLOCKS</span>
+            <span style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <span style={{ fontSize: 10, color: "#64748b" }}>{sidebarBuildings.length}</span>
+              <span style={{ fontSize: 12, color: "#94a3b8" }}>{buildingBlocksOpen ? "▾" : "▸"}</span>
+            </span>
+          </button>
+          {buildingBlocksOpen ? sidebarBuildings.map((building) => (
             <div
-              key={building.id}
+              key={canonicalBuildingIdOf(building)}
               onClick={() => {
                 setSelectedBuildingId(building.id);
                 setSelectedPortKey(null);
@@ -4581,7 +5114,7 @@ export default function NychaNoc() {
               </div>
               <span style={{ fontSize: 9, color: STATUS_COLOR[building.status] }}>{building.status}</span>
             </div>
-          ))}
+          )) : null}
 
           <div style={{ fontSize: 10, letterSpacing: "0.1em", color: "#475569", margin: "16px 0 10px" }}>CAMBIUM RADIOS</div>
           {radios.map((radio) => (

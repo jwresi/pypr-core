@@ -595,6 +595,7 @@ NETBOX_RENAME_PROPOSALS_CSV = Path(
 )
 VILO_AUDIT_OUT_DIR = Path(os.environ.get("JAKE_VILO_AUDIT_DIR") or os.environ.get("JAKE_VILO_AUDIT_OUT_DIR") or str(REPO_ROOT / "output" / "vilo_audit"))
 TAUC_NYCHA_AUDIT_CSV = Path(os.environ.get("JAKE_TAUC_AUDIT_CSV", str(REPO_ROOT / "output/tauc_nycha_cpe_audit_latest.csv")))
+UI_SITE_COORDS_JSON = REPO_ROOT / "apps" / "ui" / "site-coords.json"
 NYCHA_INFO_CSV = next(
     (
         candidate
@@ -613,16 +614,56 @@ DEVICE_LABEL_RE = re.compile(r"^\d{6}\.\d{3}\.[A-Z]+\d{2}$")
 # Deterministic overrides for radios/sites that should not rely on fuzzy location matching.
 # Use `None` when the address should remain unresolved until a canonical NetBox prefix exists.
 ADDRESS_RESOLUTION_OVERRIDES: dict[str, dict[str, Any] | None] = {
+    normalize_free_text("728 E New York Ave, Brooklyn, NY 11203"): {
+        "location": "728 E New York Ave, Brooklyn, NY 11203",
+        "prefix": "000007.055",
+        "site_code": "000007",
+        "score": 1000,
+        "device_names": ["000007.055.R01", "000007.055.SW01"],
+    },
     normalize_free_text("726 Fenimore St, Brooklyn, NY 11203"): None,
-    normalize_free_text("225 Buffalo Ave, Brooklyn, NY 11213"): None,
+    normalize_free_text("225 Buffalo Ave, Brooklyn, NY 11213"): {
+        "location": "225 Buffalo Ave",
+        "prefix": "000007.005",
+        "site_code": "000007",
+        "score": 1000,
+        "device_names": ["000007.005.SW01"],
+    },
     normalize_free_text("508 Howard Ave, Brooklyn, NY 11233"): None,
     normalize_free_text("545 Ralph Ave, Brooklyn, NY 11233"): None,
     normalize_free_text("1371 St Marks Ave, Brooklyn, NY 11233"): None,
-    normalize_free_text("1640 Sterling Pl, Brooklyn, NY 11233"): None,
+    normalize_free_text("1640 Sterling Pl, Brooklyn, NY 11233"): {
+        "location": "1640 Sterling Pl",
+        "prefix": "000007.022",
+        "site_code": "000007",
+        "score": 1000,
+        "device_names": ["000007.022.SW01"],
+    },
     normalize_free_text("1691 St Johns Pl, Brooklyn, NY 11233"): None,
     normalize_free_text("1724 Sterling Pl, Brooklyn, NY 11233"): None,
     normalize_free_text("1767 Sterling Pl, Brooklyn, NY 11233"): None,
 }
+
+_SITE_COORDS_CACHE: dict[str, dict[str, float]] | None = None
+
+
+def address_stem_key(value: str | None) -> str:
+    return normalize_free_text(str(value or "").split(",", 1)[0])
+
+
+def load_site_coords() -> dict[str, dict[str, float]]:
+    global _SITE_COORDS_CACHE
+    if _SITE_COORDS_CACHE is not None:
+        return _SITE_COORDS_CACHE
+    try:
+        _SITE_COORDS_CACHE = json.loads(UI_SITE_COORDS_JSON.read_text())
+    except Exception:
+        _SITE_COORDS_CACHE = {}
+    return _SITE_COORDS_CACHE
+
+
+def radio_id_from_name(name: str | None) -> str:
+    return re.sub(r"(^-|-$)", "", re.sub(r"[^a-z0-9]+", "-", str(name or "").lower()))
 
 # Explicit topology edges should be avoided unless there is no other authoritative source.
 # cnWave peer links are now expected to come from exporter metrics when configured.
@@ -1763,6 +1804,9 @@ class JakeOps:
         address_inventory = self._site_address_inventory(site_id)
         address_units: dict[str, dict[str, Any]] = address_inventory["address_units"]
         building_units: dict[str, set[str]] = address_inventory["building_units"]
+        static_site_coords = load_site_coords()
+        static_site_coords_by_norm = {normalize_free_text(address): coord for address, coord in static_site_coords.items()}
+        static_site_coords_by_stem = {address_stem_key(address): coord for address, coord in static_site_coords.items()}
 
         radios: list[dict[str, Any]] = []
         radio_links: list[dict[str, Any]] = []
@@ -1815,6 +1859,7 @@ class JakeOps:
                 radio_name_to_building_id[name] = building_id
             radios.append(
                 {
+                    "id": radio_id_from_name(name),
                     "name": name,
                     "type": row.get("type"),
                     "model": model,
@@ -1833,6 +1878,25 @@ class JakeOps:
                 }
             )
 
+        radio_by_name = {str(radio.get("name") or ""): radio for radio in radios}
+
+        def radio_for_endpoint(label: str | None, location: str | None = None) -> dict[str, Any] | None:
+            label_text = str(label or "").strip()
+            if label_text and label_text in radio_by_name:
+                return radio_by_name[label_text]
+            label_key = normalize_free_text(label_text)
+            location_key = normalize_free_text(str(location or "").strip())
+            for radio in radios:
+                radio_name = str(radio.get("name") or "")
+                radio_location = str(radio.get("location") or "")
+                radio_key = normalize_free_text(radio_name)
+                radio_location_key = normalize_free_text(radio_location)
+                if location_key and (radio_location_key == location_key or radio_key == location_key):
+                    return radio
+                if label_key and (radio_key == label_key or label_key in radio_key or radio_key in label_key):
+                    return radio
+            return None
+
         for link in radio_links:
             if str(link.get("kind") or "").lower() != "siklu":
                 continue
@@ -1846,9 +1910,17 @@ class JakeOps:
                 )
 
         for link in self._cnwave_site_links(site_id):
+            from_radio = radio_for_endpoint(str(link.get("from_label") or ""), str(link.get("location") or ""))
+            to_radio = radio_for_endpoint(str(link.get("to_label") or ""), None)
             radio_links.append(
                 {
                     **link,
+                    "from_radio_id": from_radio.get("id") if from_radio else None,
+                    "to_radio_id": to_radio.get("id") if to_radio else None,
+                    "from_latitude": from_radio.get("latitude") if from_radio else None,
+                    "from_longitude": from_radio.get("longitude") if from_radio else None,
+                    "to_latitude": to_radio.get("latitude") if to_radio else None,
+                    "to_longitude": to_radio.get("longitude") if to_radio else None,
                     "from_building_id": radio_name_to_building_id.get(str(link.get("from_label") or "")),
                     "to_building_id": radio_name_to_building_id.get(str(link.get("to_label") or "")),
                 }
@@ -1899,6 +1971,35 @@ class JakeOps:
                 deduped_links[existing_index] = link
         radio_links = deduped_links
 
+        building_primary_address: dict[str, str] = {}
+        for address, entry in address_units.items():
+            building_id = canonical_scope(entry.get("building_id"))
+            if not building_id or building_id in building_primary_address:
+                continue
+            building_primary_address[building_id] = address
+        for radio in radios:
+            building_id = canonical_scope(radio.get("resolved_building_id"))
+            location = str(radio.get("location") or "").strip()
+            if not building_id or not location or building_id in building_primary_address:
+                continue
+            building_primary_address[building_id] = location
+        for building_id, address in building_primary_address.items():
+            if building_coords.get(building_id, (None, None))[0] is not None:
+                continue
+            coord = (
+                static_site_coords.get(address)
+                or static_site_coords_by_norm.get(normalize_free_text(address))
+                or static_site_coords_by_stem.get(address_stem_key(address))
+            )
+            if not coord:
+                continue
+            lat_value = coord.get("lat")
+            lon_value = coord.get("lon")
+            try:
+                building_coords[building_id] = (float(lat_value), float(lon_value))
+            except (TypeError, ValueError):
+                continue
+
         buildings: list[dict[str, Any]] = []
         seen_buildings = sorted(
             {
@@ -1917,6 +2018,7 @@ class JakeOps:
             buildings.append(
                 {
                     "building_id": building_id,
+                    "address": building_primary_address.get(building_id),
                     "customer_count": self.get_building_customer_count(building_id).get("count", 0),
                     "health": self.get_building_health(building_id, include_alerts=False),
                     "known_units": sorted(building_units.get(building_id, set())),
@@ -2134,6 +2236,36 @@ class JakeOps:
             if mac:
                 nycha_by_mac[mac] = row
 
+        ppp_rows = [
+            dict(r)
+            for r in self.db.execute(
+                """
+                select p.router_ip, p.name, p.service, p.caller_id, p.address, p.uptime, d.identity
+                from router_ppp_active p
+                left join devices d on d.scan_id=p.scan_id and d.ip=p.router_ip
+                where p.scan_id=?
+                order by p.name
+                """,
+                (scan_id,),
+            ).fetchall()
+        ]
+        ppp_by_name = {str(row.get("name") or "").strip(): row for row in ppp_rows if str(row.get("name") or "").strip()}
+        address_text = str(address_record.get("address") or "").strip()
+        address_tokens = {
+            compact_free_text(address_text),
+            compact_free_text(address_text.split(",", 1)[0] if address_text else ""),
+        } - {""}
+        ppp_rows_for_building = [
+            row for row in ppp_rows
+            if any(token in compact_free_text(str(row.get("name") or "")) for token in address_tokens)
+        ]
+        ppp_rows_by_unit: dict[str, dict[str, Any]] = {}
+        for row in ppp_rows_for_building:
+            unit = parse_unit_token(row.get("name"))
+            if not unit or unit in ppp_rows_by_unit:
+                continue
+            ppp_rows_by_unit[unit] = row
+
         live_bridge_hits = [
             dict(r)
             for r in self.db.execute(
@@ -2168,6 +2300,28 @@ class JakeOps:
                     "interface": str(hit.get("on_interface") or "").strip(),
                     "mac": mac,
                     "evidence_sources": ["nycha_info_mac", "bridge_host"],
+                }
+            )
+            exact_keys.add(key)
+
+        for row in ppp_rows_for_building:
+            unit = parse_unit_token(row.get("name"))
+            caller_id = norm_mac(row.get("caller_id") or "")
+            hit = bridge_hit_by_mac.get(caller_id)
+            if not unit or not hit:
+                continue
+            key = (unit, canonical_identity(hit.get("identity")), str(hit.get("on_interface") or "").strip())
+            if key in exact_keys:
+                continue
+            exact_matches.append(
+                {
+                    "network_name": str(row.get("name") or "").strip(),
+                    "unit": unit,
+                    "classification": "router_pppoe_name_bridge_match",
+                    "switch_identity": canonical_identity(hit.get("identity")),
+                    "interface": str(hit.get("on_interface") or "").strip(),
+                    "mac": caller_id,
+                    "evidence_sources": ["router_pppoe_session", "bridge_host"],
                 }
             )
             exact_keys.add(key)
@@ -2213,22 +2367,8 @@ class JakeOps:
             if canonical_scope(radio.get("resolved_building_id")) == building_id
         ]
 
-        known_units = sorted(address_record.get("units") or [])
+        known_units = sorted(set(address_record.get("units") or []) | set(ppp_rows_by_unit.keys()))
         exact_unit_set = {row["unit"] for row in exact_matches}
-        ppp_rows = [
-            dict(r)
-            for r in self.db.execute(
-                """
-                select p.router_ip, p.name, p.service, p.caller_id, p.address, p.uptime, d.identity
-                from router_ppp_active p
-                left join devices d on d.scan_id=p.scan_id and d.ip=p.router_ip
-                where p.scan_id=?
-                order by p.name
-                """,
-                (scan_id,),
-            ).fetchall()
-        ]
-        ppp_by_name = {str(row.get("name") or "").strip(): row for row in ppp_rows if str(row.get("name") or "").strip()}
         arp_rows = [
             dict(r)
             for r in self.db.execute(
@@ -2241,8 +2381,9 @@ class JakeOps:
         exact_match_by_unit = {row["unit"]: row for row in exact_matches}
         for unit in known_units:
             inventory = nycha_by_unit.get(unit, {})
-            network_name = str(inventory.get("PPPoE") or "").strip()
-            mac = norm_mac(inventory.get("MAC Address") or inventory.get("mac") or "")
+            inferred_ppp = ppp_rows_by_unit.get(unit, {})
+            network_name = str(inventory.get("PPPoE") or inferred_ppp.get("name") or "").strip()
+            mac = norm_mac(inventory.get("MAC Address") or inventory.get("mac") or inferred_ppp.get("caller_id") or "")
             sources: list[str] = []
             state = "unknown"
             exact = exact_match_by_unit.get(unit)
@@ -2675,6 +2816,7 @@ class JakeOps:
                     "network_id": (network or {}).get("network_id"),
                     "network_name": (network or {}).get("network_name"),
                     "network_status": (network or {}).get("network_status"),
+                    "network_context": self._vilo_network_context(network),
                     "network_name_building_hint": expected_building,
                     "network_name_building_drift": network_name_building_drift,
                     "subscriber": {
@@ -2727,6 +2869,7 @@ class JakeOps:
                     "network_id": (network or {}).get("network_id"),
                     "network_name": (network or {}).get("network_name"),
                     "network_status": (network or {}).get("network_status"),
+                    "network_context": self._vilo_network_context(network),
                     "network_name_building_hint": expected_building,
                     "network_name_building_drift": network_name_building_drift,
                     "subscriber": {
@@ -2770,6 +2913,7 @@ class JakeOps:
                         "classification": "seen_not_in_vilo_inventory",
                         "network_id": (network or {}).get("network_id"),
                         "network_name": (network or {}).get("network_name"),
+                        "network_context": self._vilo_network_context(network),
                         "network_name_building_hint": expected_building,
                         "network_name_building_drift": network_name_building_drift,
                         "subscriber": {
@@ -2993,6 +3137,165 @@ class JakeOps:
                 "counts_by_classification": counts,
             },
         }
+
+    def _vilo_network_context(self, network: dict[str, Any] | None) -> dict[str, Any] | None:
+        if not network:
+            return None
+        context = {
+            "network_id": network.get("network_id"),
+            "network_name": network.get("network_name"),
+            "network_status": network.get("network_status"),
+            "uptime": network.get("uptime"),
+            "vilo_online_num": network.get("vilo_online_num"),
+            "vilo_offline_num": network.get("vilo_offline_num"),
+            "device_online_num": network.get("device_online_num"),
+            "device_offline_num": network.get("device_offline_num"),
+            "wan_ip_address": network.get("wan_ip_address"),
+            "public_ip_address": network.get("public_ip_address"),
+            "firmware_version": network.get("firmware_version"),
+            "installer": network.get("installer"),
+            "subscriber_id": network.get("subscriber_id"),
+        }
+        wan_ip = str(context.get("wan_ip_address") or "").strip()
+        public_ip = str(context.get("public_ip_address") or "").strip()
+        flags: list[str] = []
+        if wan_ip and not wan_ip.startswith("192.168."):
+            flags.append("wan_ip_outside_expected_private_range")
+        if not public_ip:
+            flags.append("missing_public_ip")
+        context["flags"] = flags
+        return context
+
+    def _tauc_scope_rows(self, site_id: str | None = None, building_id: str | None = None) -> list[dict[str, Any]]:
+        canonical_site_id = canonical_scope(site_id) if site_id else None
+        canonical_building_id = canonical_scope(building_id) if building_id else None
+        rows: list[dict[str, Any]] = []
+        for row in load_tauc_nycha_audit_rows():
+            expected_prefix = canonical_scope(row.get("expected_prefix") or row.get("prefix"))
+            if canonical_building_id and expected_prefix != canonical_building_id:
+                continue
+            if not canonical_building_id and canonical_site_id and expected_prefix and not identity_matches_scope(expected_prefix, canonical_site_id):
+                continue
+            rows.append(dict(row))
+        return rows
+
+    def get_building_cpe_intelligence(self, building_id: str, limit: int = 500) -> dict[str, Any]:
+        building_id = canonical_scope(building_id)
+        customer_count = self.get_building_customer_count(building_id)
+        building_health = self.get_building_health(building_id, include_alerts=False)
+
+        vilo_rows: list[dict[str, Any]] = []
+        vilo_summary: dict[str, Any] = {"configured": self.vilo_api is not None, "count": 0, "firmware_versions": {}, "dark_candidate_count": 0}
+        if self.vilo_api:
+            try:
+                audit = self.get_vilo_inventory_audit(building_id=building_id, limit=max(200, int(limit)))
+                firmware_versions: dict[str, int] = {}
+                for row in audit.get("rows") or []:
+                    network = self._vilo_network_context((row.get("network") or row.get("network_context") or {}))
+                    context = {
+                        "device_mac": row.get("device_mac"),
+                        "classification": row.get("classification"),
+                        "inventory_status": row.get("inventory_status"),
+                        "device_sn": row.get("device_sn"),
+                        "subscriber_id": row.get("subscriber_id"),
+                        "subscriber": row.get("subscriber"),
+                        "subscriber_hint": row.get("subscriber_hint"),
+                        "network": network,
+                        "sighting": row.get("sighting"),
+                    }
+                    if network and network.get("firmware_version"):
+                        version = str(network.get("firmware_version"))
+                        firmware_versions[version] = firmware_versions.get(version, 0) + 1
+                    vilo_rows.append(context)
+                vilo_summary = {
+                    "configured": True,
+                    "count": len(vilo_rows),
+                    "firmware_versions": dict(sorted(firmware_versions.items(), key=lambda item: (-item[1], item[0]))),
+                    "dark_candidate_count": sum(
+                        1
+                        for row in vilo_rows
+                        if row.get("network")
+                        and int(row["network"].get("device_online_num") or 0) == 0
+                        and int(row["network"].get("device_offline_num") or 0) == 0
+                    ),
+                }
+            except Exception as exc:
+                vilo_summary = {"configured": True, "error": str(exc), "count": 0, "firmware_versions": {}, "dark_candidate_count": 0}
+
+        tauc_rows = []
+        for row in self._tauc_scope_rows(building_id=building_id):
+            tauc_rows.append(
+                {
+                    "network_name": row.get("networkName") or row.get("network_name"),
+                    "site_id": row.get("userNetworkProfileCity") or row.get("site_id"),
+                    "expected_prefix": canonical_scope(row.get("expected_prefix") or row.get("prefix")),
+                    "mac": norm_mac(row.get("tauc_mac") or row.get("mac") or ""),
+                    "sn": str(row.get("sn") or row.get("device_sn") or ""),
+                    "wan_mode": ((row.get("preConfig") or {}) if isinstance(row.get("preConfig"), dict) else {}).get("wanMode"),
+                    "mesh_nodes": len((row.get("meshUnitList") or [])) if isinstance(row.get("meshUnitList"), list) else 0,
+                    "raw": row,
+                }
+            )
+
+        dark_building = bool(building_health.get("device_count", 0) > 0 and not vilo_rows and not tauc_rows and customer_count.get("count", 0) == 0)
+
+        return {
+            "building_id": building_id,
+            "vendor_summary": customer_count.get("vendor_summary") or {},
+            "customer_count": customer_count.get("count", 0),
+            "access_port_count": customer_count.get("access_port_count", 0),
+            "switch_count": customer_count.get("switch_count", 0),
+            "dark_building": dark_building,
+            "vilo": {
+                **vilo_summary,
+                "rows": vilo_rows[:limit],
+            },
+            "tauc": {
+                "configured": self.tauc is not None or bool(tauc_rows),
+                "count": len(tauc_rows),
+                "rows": tauc_rows[:limit],
+            },
+        }
+
+    def get_cpe_context(self, mac: str, building_id: str | None = None) -> dict[str, Any]:
+        normalized_mac = norm_mac(mac)
+        vendor = mac_vendor_group(normalized_mac)
+        building_scope = canonical_scope(building_id) if building_id else None
+        response: dict[str, Any] = {
+            "mac": normalized_mac,
+            "vendor": vendor,
+            "building_id": building_scope,
+            "vilo": None,
+            "tauc": None,
+        }
+        if vendor == "vilo" or self.vilo_api:
+            try:
+                audit = self.get_vilo_inventory_audit(building_id=building_scope, limit=500) if building_scope else self.get_vilo_inventory_audit(site_id=None, building_id=None, limit=2000)
+                match = next((row for row in audit.get("rows") or [] if norm_mac(row.get("device_mac") or "") == normalized_mac), None)
+                if match:
+                    response["vilo"] = {
+                        "classification": match.get("classification"),
+                        "inventory_status": match.get("inventory_status"),
+                        "device_sn": match.get("device_sn"),
+                        "subscriber_id": match.get("subscriber_id"),
+                        "subscriber": match.get("subscriber"),
+                        "subscriber_hint": match.get("subscriber_hint"),
+                        "network": self._vilo_network_context((match.get("network") or match.get("network_context") or {})),
+                        "sighting": match.get("sighting"),
+                    }
+            except Exception as exc:
+                response["vilo"] = {"error": str(exc)}
+        tauc_match = next((row for row in self._tauc_scope_rows(building_id=building_scope) if norm_mac(row.get("tauc_mac") or row.get("mac") or "") == normalized_mac), None)
+        if tauc_match:
+            response["tauc"] = {
+                "network_name": tauc_match.get("networkName") or tauc_match.get("network_name"),
+                "site_id": tauc_match.get("userNetworkProfileCity") or tauc_match.get("site_id"),
+                "expected_prefix": canonical_scope(tauc_match.get("expected_prefix") or tauc_match.get("prefix")),
+                "wan_mode": ((tauc_match.get("preConfig") or {}) if isinstance(tauc_match.get("preConfig"), dict) else {}).get("wanMode"),
+                "mesh_nodes": len((tauc_match.get("meshUnitList") or [])) if isinstance(tauc_match.get("meshUnitList"), list) else 0,
+                "sn": str(tauc_match.get("sn") or tauc_match.get("device_sn") or ""),
+            }
+        return response
 
     def get_building_flap_history(self, building_id: str) -> dict[str, Any]:
         rows = self._port_map_scope_rows(building_id=building_id)

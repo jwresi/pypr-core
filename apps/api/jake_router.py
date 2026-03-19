@@ -141,6 +141,14 @@ def building_customers(building_id: str) -> dict:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
+@router.get("/buildings/{building_id}/cpes")
+def building_cpes(building_id: str, limit: int = 200) -> dict:
+    try:
+        return _ops().get_building_cpe_intelligence(building_id, limit=limit)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
 @router.get("/buildings/{building_id}/flap-history")
 def building_flap_history(building_id: str) -> dict:
     try:
@@ -165,6 +173,14 @@ def switch_summary(switch_id: str) -> dict:
 def trace_mac(mac: str = Query(..., description="MAC address to trace"), include_bigmac: bool = True) -> dict:
     try:
         return _ops().trace_mac(mac, include_bigmac)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.get("/cpe-context")
+def cpe_context(mac: str = Query(...), building_id: str | None = None) -> dict:
+    try:
+        return _ops().get_cpe_context(mac, building_id=building_id)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
